@@ -1,0 +1,52 @@
+# FILE: .github/workflows/bundle_for_llm.yml
+name: Bundle Codebase for AI Analysis
+
+# Запускается вручную через вкладку Actions в GitHub
+on:
+  workflow_dispatch:
+
+jobs:
+  build-bundle:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Generate Codebase Bundle
+        run: |
+          BUNDLE_FILE="repo_bundle.txt"
+          echo "=== OMNISCAN PROJECT CODEBASE BUNDLE ===" > $BUNDLE_FILE
+          echo "Generated on: $(date)" >> $BUNDLE_FILE
+          echo "========================================" >> $BUNDLE_FILE
+          echo "" >> $BUNDLE_FILE
+
+          # Ищем все файлы, игнорируя скрытые папки (.git, .github), зависимости и бинарники
+          find . -type f \
+            -not -path "*/\.*" \
+            -not -path "*/node_modules/*" \
+            -not -path "*/venv/*" \
+            -not -path "*/__pycache__/*" \
+            -not -path "*/build/*" \
+            -not -name "*.png" \
+            -not -name "*.jpg" \
+            -not -name "*.jpeg" \
+            -not -name "*.gif" \
+            -not -name "*.zip" \
+            -not -name "*.tar.gz" \
+            -not -name "*.pdf" \
+            -not -name "repo_bundle.txt" | sort | while read -r file; do
+              
+              echo -e "\n\n// FILE: $file" >> $BUNDLE_FILE
+              echo "----------------------------------------" >> $BUNDLE_FILE
+              
+              # Записываем содержимое файла
+              cat "$file" >> $BUNDLE_FILE
+          done
+
+      - name: Upload Bundle as Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-codebase-bundle
+          path: repo_bundle.txt
+          retention-days: 1
