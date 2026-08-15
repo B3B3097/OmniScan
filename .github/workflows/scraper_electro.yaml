@@ -1,0 +1,68 @@
+name: ⚡ Electronics & Marketplaces 24/7 Scraper
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: read
+
+jobs:
+  scrape-tech:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        city: ["Ульяновск", "Москва", "Санкт-Петербург", "Казань", "Екатеринбург", "Краснодар"]
+        platform: ["wb", "ozon", "dns", "mvideo"]
+    
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python 3.12 Environment
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install System Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxml2-dev libxslt-dev curl jq
+
+      - name: Install Python Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install aiohttp pydantic beautifulsoup4 lxml redis dadata tenacity firebase-admin urllib3 colorama
+
+      - name: Execute Async Scraper Engine
+        env:
+          TARGET_CITY: ${{ matrix.city }}
+          TARGET_PLATFORM: ${{ matrix.platform }}
+          DADATA_API_KEY: ${{ secrets.DADATA_API_KEY }}
+          PROXY_URL: ${{ secrets.PROXY_URL }}
+          PYTHONUNBUFFERED: "1"
+        run: python3 engine/scrapers/universal_async_scraper.py
+        
+      - name: Validate Generated JSON Data
+        run: |
+          for file in data/tech/*.json; do
+            if [ -f "$file" ]; then
+              jq empty "$file" || (echo "JSON Error in $file" && exit 1)
+            fi
+          done
+
+      - name: Commit and Push State to Repository
+        run: |
+          git config --global user.name "MarketVision-Tech-Bot"
+          git config --global user.email "tech-bot@marketvision.local"
+          git remote set-url origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}
+          git pull --rebase origin main
+          git add data/tech/*.json
+          git diff --quiet && git diff --staged --quiet || (git commit -m "auto-update: Scraped prices for ${{ matrix.city }} on ${{ matrix.platform }}" && git push origin main)
+
