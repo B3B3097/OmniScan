@@ -1,12 +1,15 @@
 # FILE: .github/workflows/bundle_for_llm.yml
-name: Bundle Codebase for AI Analysis
+name: Auto-Commit Codebase Bundle
 
-# Запускается вручную через вкладку Actions в GitHub
 on:
   workflow_dispatch:
 
+# Выдаем права боту на запись в репозиторий
+permissions:
+  contents: write
+
 jobs:
-  build-bundle:
+  build-and-commit:
     runs-on: ubuntu-latest
 
     steps:
@@ -16,12 +19,12 @@ jobs:
       - name: Generate Codebase Bundle
         run: |
           BUNDLE_FILE="repo_bundle.txt"
-          echo "=== OMNISCAN PROJECT CODEBASE BUNDLE ===" > $BUNDLE_FILE
+          echo "=== PROJECT CODEBASE BUNDLE ===" > $BUNDLE_FILE
           echo "Generated on: $(date)" >> $BUNDLE_FILE
-          echo "========================================" >> $BUNDLE_FILE
+          echo "===============================" >> $BUNDLE_FILE
           echo "" >> $BUNDLE_FILE
 
-          # Ищем все файлы, игнорируя скрытые папки (.git, .github), зависимости и бинарники
+          # Ищем файлы, исключая мусор, скрытые директории и сам бандл
           find . -type f \
             -not -path "*/\.*" \
             -not -path "*/node_modules/*" \
@@ -33,20 +36,32 @@ jobs:
             -not -name "*.jpeg" \
             -not -name "*.gif" \
             -not -name "*.zip" \
-            -not -name "*.tar.gz" \
-            -not -name "*.pdf" \
             -not -name "repo_bundle.txt" | sort | while read -r file; do
               
-              echo -e "\n\n// FILE: $file" >> $BUNDLE_FILE
-              echo "----------------------------------------" >> $BUNDLE_FILE
+              # Убираем лишние символы './' из пути для красоты
+              clean_path=$(echo "$file" | sed 's|^\./||')
               
-              # Записываем содержимое файла
+              # Пишем путь к файлу
+              echo "// FILE: $clean_path" >> $BUNDLE_FILE
+              
+              # Пишем содержимое файла (код)
               cat "$file" >> $BUNDLE_FILE
+              
+              # Отступы для читаемости
+              echo "" >> $BUNDLE_FILE
+              echo "" >> $BUNDLE_FILE
           done
 
-      - name: Upload Bundle as Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ai-codebase-bundle
-          path: repo_bundle.txt
-          retention-days: 1
+      - name: Commit and Push to Repository
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add repo_bundle.txt
+          
+          # Проверяем, есть ли изменения. Если код не менялся, коммит не создастся (чтобы не было ошибки)
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "Auto-generate codebase txt bundle"
+            git push
+          fi
