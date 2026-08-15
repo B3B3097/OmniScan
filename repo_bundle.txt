@@ -1,0 +1,3794 @@
+=== PROJECT CODEBASE BUNDLE ===
+Generated on: Sat Aug 15 22:07:06 UTC 2026
+===============================
+
+// FILE: README.md
+# OmniScan
+
+// FILE: backend/dekstop.py
+import asyncio
+import json
+import logging
+import sqlite3
+import os
+import time
+from typing import List, Dict, Optional
+from pydantic import BaseModel, Field
+import aiohttp
+
+# ==========================================
+# 1. КОНФИГУРАЦИЯ И ЛОГИРОВАНИЕ
+# ==========================================
+os.makedirs("data/db", exist_ok=True)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s'
+)
+logger = logging.getLogger("FraudDetectorEngine")
+
+# ==========================================
+# 2. PYDANTIC МОДЕЛИ
+# ==========================================
+class Review(BaseModel):
+    id: str
+    text: str
+    rating: int = Field(..., ge=1, le=5)
+    date_posted: str
+    author_name: str
+
+class SellerProfile(BaseModel):
+    seller_id: str
+    platform: str
+    name: str
+    reviews: List[Review] = Field(default_factory=list)
+
+class FraudAnalysisResult(BaseModel):
+    is_fraudulent: bool
+    fraud_score: float = Field(..., ge=0.0, le=100.0) # Процент уверенности ИИ в накрутке
+    evidence: List[str] = Field(default_factory=list) # Доказательства (почему ИИ так решил)
+    verdict: str
+
+# ==========================================
+# 3. БАЗА ДАННЫХ ЧЕРНОГО СПИСКА (BLACKLIST)
+# ==========================================
+class BlacklistManager:
+    """Управление персональным черным списком пользователей и глобальным ЧС."""
+    
+    def __init__(self, db_path: str = "data/db/blacklist.sqlite"):
+        self.db_path = db_path
+        self._init_db()
+
+    def _init_db(self):
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            # Персональный ЧС: пользователь заблокировал продавца
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS user_blacklist (
+                    user_id TEXT NOT NULL,
+                    seller_id TEXT NOT NULL,
+                    platform TEXT NOT NULL,
+                    added_at REAL NOT NULL,
+                    PRIMARY KEY (user_id, seller_id, platform)
+                )
+            """)
+            # Глобальный ЧС: ИИ пометил продавца как 100% накрутчика (фрод)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS global_fraud_list (
+                    seller_id TEXT NOT NULL,
+                    platform TEXT NOT NULL,
+                    fraud_score REAL NOT NULL,
+                    reason TEXT,
+                    detected_at REAL NOT NULL,
+                    PRIMARY KEY (seller_id, platform)
+                )
+            """)
+            conn.commit()
+
+    def add_to_user_blacklist(self, user_id: str, seller_id: str, platform: str):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO user_blacklist (user_id, seller_id, platform, added_at) VALUES (?, ?, ?, ?)",
+                (user_id, seller_id, platform, time.time())
+            )
+            conn.commit()
+            logger.info(f"[Blacklist] Пользователь {user_id} заблокировал продавца {seller_id} ({platform})")
+
+    def add_to_global_fraud(self, seller_id: str, platform: str, score: float, reason: str):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO global_fraud_list (seller_id, platform, fraud_score, reason, detected_at) VALUES (?, ?, ?, ?, ?)",
+                (seller_id, platform, score, reason, time.time())
+            )
+            conn.commit()
+            logger.warning(f"[Fraud DB] Продавец {seller_id} занесен в глобальный ЧС. Скор: {score}")
+
+    def is_seller_blocked(self, user_id: str, seller_id: str, platform: str) -> bool:
+        """Проверка: заблокирован ли продавец юзером ИЛИ глобальным ИИ фильтром."""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            
+            # Проверка персонального ЧС
+            cursor.execute("SELECT 1 FROM user_blacklist WHERE user_id = ? AND seller_id = ? AND platform = ?", (user_id, seller_id, platform))
+            if cursor.fetchone():
+                return True
+                
+            # Проверка глобального ЧС (фрод > 80%)
+            cursor.execute("SELECT fraud_score FROM global_fraud_list WHERE seller_id = ? AND platform = ?", (seller_id, platform))
+            result = cursor.fetchone()
+            if result and result[0] >= 80.0:
+                return True
+                
+        return False
+
+# ==========================================
+# 4. ИИ-ДВИЖОК АНАЛИЗА ОТЗЫВОВ (LLM)
+# ==========================================
+class AIFraudDetector:
+    """Анализирует текст отзывов через LLM для выявления паттернов ботоферм."""
+    
+    def __init__(self, use_local_ollama: bool = True):
+        self.use_local = use_local_ollama
+        self.endpoint = "http://127.0.0.1:11434/api/generate" # Адрес локальной Ollama
+
+    def _build_prompt(self, seller_name: str, reviews: List[Review]) -> str:
+        reviews_text = "\n".join([f"[{r.date_posted}] {r.author_name} (Оценка: {r.rating}/5): {r.text}" for r in reviews])
+        
+        prompt = f"""Ты эксперт по кибербезопасности и анализу данных. Твоя задача — выявить накрученные (фейковые) отзывы продавца '{seller_name}'.
+Признаки накрутки:
+1. Однотипные, короткие фразы ("Всё супер", "Отличный продавец", "Рекомендую").
+2. Отсутствие конкретики о товаре.
+3. Подозрительная кучность (много 5-звездочных отзывов за 1-2 дня).
+4. Одинаковая структура предложений у разных авторов.
+
+Вот последние отзывы продавца:
+{reviews_text}
+
+Проанализируй их. Ответь СТРОГО в формате JSON без markdown разметки:
+{{
+    "is_fraudulent": true/false,
+    "fraud_score": 0.0-100.0,
+    "evidence": ["причина 1", "причина 2"],
+    "verdict": "Краткий вывод"
+}}"""
+        return prompt
+
+    async def analyze_seller(self, seller: SellerProfile) -> FraudAnalysisResult:
+        if len(seller.reviews) < 3:
+            # Слишком мало данных для анализа
+            return FraudAnalysisResult(is_fraudulent=False, fraud_score=0.0, evidence=["Мало отзывов"], verdict="Недостаточно данных")
+
+        prompt = self._build_prompt(seller.name, seller.reviews)
+        logger.info(f"Отправка {len(seller.reviews)} отзывов продавца {seller.seller_id} на ИИ-анализ...")
+
+        # Эмуляция вызова к LLM (в проде здесь aiohttp запрос к Ollama/OpenAI)
+        await asyncio.sleep(2) 
+        
+        # Простейшая эмуляция ответа ИИ для примера. 
+        # Если в отзывах есть спам-паттерн (например все отзывы в один день и короткие)
+        is_spam_likely = all(len(r.text) < 20 for r in seller.reviews) and len(seller.reviews) > 5
+
+        if is_spam_likely:
+            mock_ai_response = {
+                "is_fraudulent": True,
+                "fraud_score": 95.5,
+                "evidence": [
+                    "Все отзывы состоят из 2-3 слов.",
+                    "Отсутствует описание реального опыта покупки.",
+                    "Высокая плотность отзывов с оценкой 5/5."
+                ],
+                "verdict": "Критическая вероятность накрутки ботофермой."
+            }
+        else:
+            mock_ai_response = {
+                "is_fraudulent": False,
+                "fraud_score": 15.0,
+                "evidence": ["Отзывы содержат уникальные детали.", "Разное время публикации."],
+                "verdict": "Отзывы выглядят органическими."
+            }
+
+        return FraudAnalysisResult(**mock_ai_response)
+
+# ==========================================
+# 5. ГЕЙТВЕЙ УВЕДОМЛЕНИЙ (ПЕРЕХВАТЧИК PUSH)
+# ==========================================
+class PushNotificationFilter:
+    """Проверяет товары перед отправкой PUSH-уведомлений пользователю."""
+    
+    def __init__(self):
+        self.blacklist = BlacklistManager()
+        self.ai_detector = AIFraudDetector()
+
+    async def process_and_filter(self, user_id: str, item: dict, seller: SellerProfile) -> bool:
+        """
+        Возвращает True, если уведомление МОЖНО отправлять.
+        Возвращает False, если продавец в ЧС или накрутчик.
+        """
+        # 1. Быстрая проверка по базам (Персональный ЧС + Глобальный фрод)
+        if self.blacklist.is_seller_blocked(user_id, seller.seller_id, seller.platform):
+            logger.info(f"[PUSH FILTER] Отмена отправки. Продавец {seller.seller_id} заблокирован или в глобальном ЧС.")
+            return False
+
+        # 2. Если продавца нет в БД, натравливаем ИИ для анализа "на лету"
+        analysis = await self.ai_detector.analyze_seller(seller)
+        
+        if analysis.is_fraudulent and analysis.fraud_score >= 80.0:
+            logger.warning(f"[PUSH FILTER] ИИ обнаружил фрод! Скор: {analysis.fraud_score}. Заносим в глобальный ЧС.")
+            self.blacklist.add_to_global_fraud(seller.seller_id, seller.platform, analysis.fraud_score, analysis.verdict)
+            return False # Блокируем пуш
+
+        logger.info(f"[PUSH FILTER] Проверка пройдена. Продавец чист (Фрод скор: {analysis.fraud_score}%). Пуш разрешен.")
+        return True
+
+# ==========================================
+# 6. БЛОК ТЕСТИРОВАНИЯ (СИМУЛЯЦИЯ)
+# ==========================================
+async def test_fraud_engine():
+    # Инициализируем систему
+    push_filter = PushNotificationFilter()
+    blacklist_mgr = push_filter.blacklist
+
+    user = "user_999"
+    
+    # Ситуация 1: Пользователь сам блокирует нормального продавца, потому что он ему не нравится
+    print("--- СИТУАЦИЯ 1: Ручная блокировка (Персональный ЧС) ---")
+    blacklist_mgr.add_to_user_blacklist(user, seller_id="seller_123", platform="avito")
+    
+    mock_seller_1 = SellerProfile(
+        seller_id="seller_123", platform="avito", name="Иван Иванов",
+        reviews=[Review(id="1", text="Хорошая машина", rating=5, date_posted="2026-08-01", author_name="Алексей")]
+    )
+    
+    can_send_1 = await push_filter.process_and_filter(user, item={"title": "BMW X5"}, seller=mock_seller_1)
+    print(f"Пуш отправлен: {can_send_1}\n")
+
+
+    # Ситуация 2: Новый продавец с явно накрученными отзывами (работа ИИ)
+    print("--- СИТУАЦИЯ 2: Работа ИИ (Накрученные отзывы) ---")
+    mock_seller_2 = SellerProfile(
+        seller_id="scammer_777", platform="wb", name="SuperShop",
+        reviews=[
+            Review(id="10", text="Всё супер", rating=5, date_posted="2026-08-15", author_name="User1"),
+            Review(id="11", text="Отличный продавец", rating=5, date_posted="2026-08-15", author_name="User2"),
+            Review(id="12", text="Рекомендую", rating=5, date_posted="2026-08-15", author_name="User3"),
+            Review(id="13", text="Супер", rating=5, date_posted="2026-08-15", author_name="User4"),
+            Review(id="14", text="Круто", rating=5, date_posted="2026-08-15", author_name="User5"),
+            Review(id="15", text="Всё супер", rating=5, date_posted="2026-08-15", author_name="User6"),
+        ]
+    )
+    
+    can_send_2 = await push_filter.process_and_filter(user, item={"title": "iPhone 15"}, seller=mock_seller_2)
+    print(f"Пуш отправлен: {can_send_2}\n")
+
+
+    # Ситуация 3: Нормальный продавец с органическими отзывами
+    print("--- СИТУАЦИЯ 3: Органические отзывы (Чистый продавец) ---")
+    mock_seller_3 = SellerProfile(
+        seller_id="good_guy_001", platform="ozon", name="TechStore",
+        reviews=[
+            Review(id="20", text="Брал ноутбук для работы. Упаковка была немного помята, но сам ноут работает отлично. Положили в подарок мышку.", rating=4, date_posted="2026-08-10", author_name="Михаил"),
+            Review(id="21", text="Доставка задержалась на день. Продавец отвечал на сообщения быстро. Товар соответствует описанию.", rating=5, date_posted="2026-08-12", author_name="Ольга"),
+            Review(id="22", text="Отличный сервис, помогли подобрать конфигурацию.", rating=5, date_posted="2026-08-14", author_name="Сергей"),
+        ]
+    )
+    
+    can_send_3 = await push_filter.process_and_filter(user, item={"title": "MacBook Air"}, seller=mock_seller_3)
+    print(f"Пуш отправлен: {can_send_3}")
+
+if __name__ == "__main__":
+    asyncio.run(test_fraud_engine())
+
+
+// FILE: backend/engine/engine_compromat.py
+import asyncio
+import aiohttp
+import logging
+import re
+import json
+from datetime import datetime
+from typing import List, Dict, Optional, Any
+from bs4 import BeautifulSoup
+from pydantic import BaseModel, Field
+
+# ==========================================
+# 1. КОНФИГУРАЦИЯ И ЛОГИРОВАНИЕ
+# ==========================================
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s'
+)
+logger = logging.getLogger("KompromatEngine")
+
+# ==========================================
+# 2. СТРОГИЕ МОДЕЛИ ДАННЫХ (DOSSIER)
+# ==========================================
+class AccidentRecord(BaseModel):
+    date: str
+    type: str
+    region: str
+    damage_points: List[str] = Field(default_factory=list)
+
+class OwnershipPeriod(BaseModel):
+    from_date: str
+    to_date: Optional[str] = "Настоящее время"
+    owner_type: str  # "Физическое лицо" / "Юридическое лицо"
+
+class NomerogramPhoto(BaseModel):
+    url: str
+    date_posted: Optional[str] = None
+    source: Optional[str] = "nomerogram.ru"
+    is_accident_likely: bool = False
+
+class DebtRecord(BaseModel):
+    department: str
+    bailiff: str
+    amount: float
+    subject: str
+
+class CarDossier(BaseModel):
+    vin: str
+    license_plate: Optional[str] = None
+    brand: str
+    model: str
+    year: int
+    owners_count: int = 0
+    ownership_history: List[OwnershipPeriod] = Field(default_factory=list)
+    accidents: List[AccidentRecord] = Field(default_factory=list)
+    is_wanted: bool = False
+    has_restrictions: bool = False
+    pledge_status: bool = False  # В залоге у банка
+    nomerogram_photos: List[NomerogramPhoto] = Field(default_factory=list)
+    seller_debts: List[DebtRecord] = Field(default_factory=list)
+    
+    @property
+    def is_critical_risk(self) -> bool:
+        """Автоматическая отбраковка машин с криминалом или тоталом."""
+        return self.is_wanted or self.has_restrictions or len(self.accidents) > 2
+
+# ==========================================
+# 3. ПАРСЕР НОМЕРОГРАМА (NOMEROGRAM.RU)
+# ==========================================
+class NomerogramScraper:
+    """Извлекает исторические фотографии автомобиля по госномеру."""
+    
+    def __init__(self, proxy_url: Optional[str] = None):
+        self.base_url = "https://www.nomerogram.ru/api/v1/cars"
+        self.proxy = proxy_url
+        self.headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+            "Accept": "application/json, text/plain, */*",
+            "Origin": "https://www.nomerogram.ru",
+            "Referer": "https://www.nomerogram.ru/"
+        }
+
+    def _format_plate(self, plate: str) -> str:
+        """Очистка госномера от лишних символов (оставляем только буквы и цифры)."""
+        return re.sub(r'[^А-Яа-яA-Za-z0-9]', '', plate).upper()
+
+    async def fetch_photos(self, session: aiohttp.ClientSession, plate: str) -> List[NomerogramPhoto]:
+        clean_plate = self._format_plate(plate)
+        if not clean_plate:
+            return []
+
+        # API Номерограма обычно требует специфичных токенов или хешей,
+        # в реальном бою часто парсят HTML веб-версии, если API закрыто.
+        # Здесь реализован гибридный подход: стучимся в веб-морду и парсим DOM.
+        url = f"https://www.nomerogram.ru/n/{clean_plate}/"
+        logger.info(f"[Nomerogram] Поиск фотографий для госномера: {clean_plate}")
+
+        photos = []
+        try:
+            async with session.get(url, headers=self.headers, proxy=self.proxy, timeout=15) as response:
+                if response.status == 200:
+                    html = await response.text()
+                    soup = BeautifulSoup(html, 'lxml')
+                    
+                    # Ищем все теги img, которые относятся к галерее авто
+                    img_tags = soup.find_all('img', class_=re.compile(r'car-photo|gallery-item'))
+                    
+                    for img in img_tags:
+                        src = img.get('src') or img.get('data-src')
+                        if src and 'nomerogram' in src:
+                            # Простая эвристика: если в alt есть слова 'дтп', 'авария'
+                            alt_text = img.get('alt', '').lower()
+                            is_crash = any(word in alt_text for word in ['дтп', 'авария', 'разбита', 'удар'])
+                            
+                            photos.append(NomerogramPhoto(
+                                url=src,
+                                date_posted=datetime.utcnow().strftime("%Y-%m-%d"), # В реальности парсится из соседнего тега
+                                is_accident_likely=is_crash
+                            ))
+                            
+                    logger.info(f"[Nomerogram] Найдено {len(photos)} фото для {clean_plate}")
+                elif response.status == 404:
+                    logger.info(f"[Nomerogram] Фото для {clean_plate} не найдены (404).")
+                else:
+                    logger.warning(f"[Nomerogram] Ошибка доступа. Статус: {response.status}")
+        except asyncio.TimeoutError:
+            logger.error(f"[Nomerogram] Таймаут при запросе {clean_plate}")
+        except Exception as e:
+            logger.error(f"[Nomerogram] Внутренняя ошибка парсинга: {e}")
+
+        return photos
+
+# ==========================================
+# 4. ИНТЕГРАЦИЯ С ГИБДД И АВТОТЕКОЙ
+# ==========================================
+class GibddAPI:
+    """Интеграция с открытыми базами ГИБДД (через прокси-шлюз или напрямую)."""
+    
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+        # В реальности ГИБДД использует сложную систему капч, 
+        # поэтому здесь эмулируется вызов к агрегатору (типа AVTOKOD или VIN01)
+        self.gateway_url = "https://api.vin-checker.local/v1"
+
+    async def get_history(self, session: aiohttp.ClientSession, vin: str) -> Dict[str, Any]:
+        """Получение истории владения, ДТП, розыска и ограничений одним запросом."""
+        logger.info(f"[GIBDD] Запрос полного отчета по VIN: {vin}")
+        
+        # Эмуляция ответа от государственного API
+        await asyncio.sleep(1.5)
+        
+        # Мок-данные для демонстрации логики сборки компромата
+        mock_response = {
+            "owners": [
+                {"from": "2018-05-12", "to": "2021-08-01", "type": "Юридическое лицо"},
+                {"from": "2021-08-05", "to": "Настоящее время", "type": "Физическое лицо"}
+            ],
+            "accidents": [
+                {
+                    "date": "2019-11-20", 
+                    "type": "Столкновение", 
+                    "region": "Москва", 
+                    "damage": ["Передний бампер", "Капот", "Левое крыло"]
+                }
+            ],
+            "wanted": False,
+            "restrictions": False,
+            "pledge": True # Машина в залоге!
+        }
+        return mock_response
+
+# ==========================================
+# 5. ИНТЕГРАЦИЯ С ФССП (СУДЕБНЫЕ ПРИСТАВЫ)
+# ==========================================
+class FsspAPI:
+    """Проверка продавца на долги (алименты, кредиты), из-за которых могут запретить регистрацию."""
+    
+    async def check_person(self, session: aiohttp.ClientSession, first_name: str, last_name: str, region: str) -> List[DebtRecord]:
+        logger.info(f"[FSSP] Проверка продавца: {last_name} {first_name}, Регион: {region}")
+        await asyncio.sleep(1.0)
+        
+        # Эмуляция парсинга базы судебных приставов
+        # Если продавец проблемный, машина может уйти под арест
+        if last_name.lower() == "перекупов":
+            return [
+                DebtRecord(
+                    department="ОСП по ЦАО г. Москвы",
+                    bailiff="Иванов И.И.",
+                    amount=150000.0,
+                    subject="Задолженность по кредитным платежам"
+                )
+            ]
+        return []
+
+# ==========================================
+# 6. ГЛАВНЫЙ АГРЕГАТОР КОМПРОМАТА (ORCHESTRATOR)
+# ==========================================
+class KompromatOrchestrator:
+    """Оркестратор, который запускает все проверки параллельно и собирает единый отчет."""
+    
+    def __init__(self, gibdd_key: str = "mock_key"):
+        self.nomerogram = NomerogramScraper()
+        self.gibdd = GibddAPI(api_key=gibdd_key)
+        self.fssp = FsspAPI()
+
+    async def generate_full_dossier(self, vin: str, plate: str, brand: str, model: str, year: int, seller_name: Optional[str] = None) -> CarDossier:
+        """Главный метод: выстреливает десятки асинхронных запросов во все базы."""
+        logger.info(f"=== СТАРТ СБОРА КОМПРОМАТА: {brand} {model} ({vin}) ===")
+        
+        dossier = CarDossier(
+            vin=vin,
+            license_plate=plate,
+            brand=brand,
+            model=model,
+            year=year
+        )
+
+        connector = aiohttp.TCPConnector(limit_per_host=10)
+        async with aiohttp.ClientSession(connector=connector) as session:
+            # Формируем пул задач для параллельного выполнения
+            tasks = [
+                self.nomerogram.fetch_photos(session, plate),
+                self.gibdd.get_history(session, vin)
+            ]
+            
+            # Если знаем имя продавца из парсера Авито, проверяем его по приставам
+            if seller_name and len(seller_name.split()) >= 2:
+                parts = seller_name.split()
+                tasks.append(self.fssp.check_person(session, first_name=parts[1], last_name=parts[0], region="77"))
+
+            # Запускаем все проверки одновременно (экономит десятки секунд)
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            # --- ПАРСИНГ РЕЗУЛЬТАТОВ ---
+            
+            # 1. Результаты Номерограма
+            if isinstance(results[0], list):
+                dossier.nomerogram_photos = results[0]
+
+            # 2. Результаты ГИБДД
+            if isinstance(results[1], dict):
+                gibdd_data = results[1]
+                dossier.is_wanted = gibdd_data.get("wanted", False)
+                dossier.has_restrictions = gibdd_data.get("restrictions", False)
+                dossier.pledge_status = gibdd_data.get("pledge", False)
+                
+                # Парсинг периодов владения
+                for owner in gibdd_data.get("owners", []):
+                    dossier.ownership_history.append(OwnershipPeriod(
+                        from_date=owner["from"],
+                        to_date=owner.get("to"),
+                        owner_type=owner["type"]
+                    ))
+                dossier.owners_count = len(dossier.ownership_history)
+                
+                # Парсинг ДТП
+                for acc in gibdd_data.get("accidents", []):
+                    dossier.accidents.append(AccidentRecord(
+                        date=acc["date"],
+                        type=acc["type"],
+                        region=acc["region"],
+                        damage_points=acc.get("damage", [])
+                    ))
+
+            # 3. Результаты ФССП (если задача запускалась)
+            if len(results) > 2 and isinstance(results[2], list):
+                dossier.seller_debts = results[2]
+
+        logger.info(f"=== СБОР ЗАВЕРШЕН. Найдено ДТП: {len(dossier.accidents)}, Фото: {len(dossier.nomerogram_photos)} ===")
+        return dossier
+
+# ==========================================
+# 7. БЛОК ТЕСТИРОВАНИЯ
+# ==========================================
+async def run_kompromat_test():
+    engine = KompromatOrchestrator()
+    
+    # Эмуляция данных, пришедших из парсера Авито
+    report = await engine.generate_full_dossier(
+        vin="XW8ZZZ61ZJG000000",
+        plate="А777АА77",
+        brand="Skoda",
+        model="Octavia",
+        year=2019,
+        seller_name="Перекупов Иван"
+    )
+    
+    print("\n" + "="*50)
+    print(f"📄 ФИНАЛЬНОЕ ДОСЬЕ НА АВТОМОБИЛЬ")
+    print("="*50)
+    print(json.dumps(report.model_dump(), indent=4, ensure_ascii=False))
+    
+    if report.is_critical_risk:
+        print("\n❌ ВНИМАНИЕ: АВТОМОБИЛЬ ОТБРАКОВАН АЛГОРИТМОМ (КРИТИЧЕСКИЙ РИСК!)")
+    elif report.pledge_status:
+        print("\n⚠️ ВНИМАНИЕ: МАШИНА В ЗАЛОГЕ У БАНКА!")
+
+if __name__ == "__main__":
+    asyncio.run(run_kompromat_test())
+
+
+// FILE: backend/engine/engine_search_engine.py
+import asyncio
+import aiohttp
+import logging
+import re
+import urllib.parse
+from typing import List, Dict, Optional, Literal
+from bs4 import BeautifulSoup
+from pydantic import BaseModel, Field
+
+# ==========================================
+# 1. КОНФИГУРАЦИЯ И ЛОГИРОВАНИЕ
+# ==========================================
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s'
+)
+logger = logging.getLogger("OSINTSearchEngine")
+
+# ==========================================
+# 2. СТРОГИЕ МОДЕЛИ ДАННЫХ
+# ==========================================
+class WebSearchResult(BaseModel):
+    engine: Literal["duckduckgo", "google", "yandex"]
+    title: str
+    url: str
+    snippet: str
+    position: int
+    is_suspicious: bool = False  # Флаг, если в сниппете найдены слова "мошенник", "скам" и т.д.
+
+class OSINTReport(BaseModel):
+    query: str
+    total_results: int
+    results: List[WebSearchResult] = Field(default_factory=list)
+    risk_score: float = 0.0  # От 0.0 до 10.0 (насколько опасен продавец/товар)
+
+# ==========================================
+# 3. DUCKDUCKGO (ПРЯМОЙ ПАРСИНГ HTML)
+# ==========================================
+class DuckDuckGoScraper:
+    """
+    Прямой парсер HTML-версии DuckDuckGo. 
+    Идеален для обхода лимитов API, так как DDG лоялен к скрапингу (особенно через TOR/Прокси).
+    """
+    def __init__(self, proxy: Optional[str] = None):
+        self.base_url = "https://html.duckduckgo.com/html/"
+        self.proxy = proxy
+        self.headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7"
+        }
+
+    async def search(self, session: aiohttp.ClientSession, query: str, limit: int = 10) -> List[WebSearchResult]:
+        logger.info(f"[DuckDuckGo] Выполнение поискового запроса: '{query}'")
+        payload = {"q": query, "b": ""}
+        results = []
+
+        try:
+            async with session.post(self.base_url, data=payload, headers=self.headers, proxy=self.proxy, timeout=15) as response:
+                if response.status == 200:
+                    html = await response.text()
+                    soup = BeautifulSoup(html, 'lxml')
+                    
+                    # Разбор специфичной верстки html.duckduckgo.com
+                    for idx, result_node in enumerate(soup.find_all('div', class_='result'), start=1):
+                        if idx > limit:
+                            break
+                            
+                        title_node = result_node.find('a', class_='result__a')
+                        snippet_node = result_node.find('a', class_='result__snippet')
+                        url_node = result_node.find('a', class_='result__url')
+                        
+                        if title_node and url_node:
+                            # DuckDuckGo часто оборачивает ссылки в свои редиректы, чистим их
+                            raw_url = url_node.get('href', '')
+                            clean_url = urllib.parse.unquote(raw_url.replace('//duckduckgo.com/l/?uddg=', '').split('&')[0])
+                            
+                            snippet = snippet_node.text.strip() if snippet_node else ""
+                            
+                            results.append(WebSearchResult(
+                                engine="duckduckgo",
+                                title=title_node.text.strip(),
+                                url=clean_url,
+                                snippet=snippet,
+                                position=idx
+                            ))
+                else:
+                    logger.warning(f"[DuckDuckGo] Блокировка или ошибка. Статус: {response.status}")
+        except Exception as e:
+            logger.error(f"[DuckDuckGo] Ошибка парсинга: {e}")
+
+        return results
+
+# ==========================================
+# 4. GOOGLE (ЧЕРЕЗ SERPER.DEV API)
+# ==========================================
+class GoogleSerperAPI:
+    """
+    Интеграция с Google Search через Serper API.
+    Обеспечивает самую точную выдачу и умеет пробивать отзывы.
+    """
+    def __init__(self, api_key: Optional[str] = None):
+        self.api_key = api_key
+        self.endpoint = "https://google.serper.dev/search"
+
+    async def search(self, session: aiohttp.ClientSession, query: str, limit: int = 10) -> List[WebSearchResult]:
+        if not self.api_key:
+            logger.warning("[Google] Ключ SERPER_API_KEY не установлен. Пропуск.")
+            return []
+
+        logger.info(f"[Google] Выполнение поискового запроса: '{query}'")
+        headers = {
+            "X-API-KEY": self.api_key,
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "q": query,
+            "gl": "ru", # Гео-локация Россия
+            "hl": "ru", # Язык Русский
+            "num": limit
+        }
+
+        results = []
+        try:
+            async with session.post(self.endpoint, headers=headers, json=payload, timeout=10) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    organic_results = data.get("organic", [])
+                    
+                    for idx, item in enumerate(organic_results, start=1):
+                        results.append(WebSearchResult(
+                            engine="google",
+                            title=item.get("title", ""),
+                            url=item.get("link", ""),
+                            snippet=item.get("snippet", ""),
+                            position=idx
+                        ))
+        except Exception as e:
+            logger.error(f"[Google] Ошибка API: {e}")
+
+        return results
+
+# ==========================================
+# 5. YANDEX (YANDEX XML API)
+# ==========================================
+class YandexXMLAPI:
+    """
+    Интеграция с Яндекс XML. Идеально для поиска информации по региональным форумам РФ.
+    Вшита локальная привязка гео-запросов.
+    """
+    def __init__(self, user: Optional[str] = None, key: Optional[str] = None):
+        self.user = user
+        self.key = key
+        self.endpoint = "https://yandex.ru/search/xml"
+        # 242 — это внутренний ID региона для точной локальной выдачи
+        self.region_id = 242 
+
+    async def search(self, session: aiohttp.ClientSession, query: str, limit: int = 10) -> List[WebSearchResult]:
+        if not self.user or not self.key:
+            logger.warning("[Yandex] Учетные данные Yandex XML не установлены. Пропуск.")
+            return []
+
+        logger.info(f"[Yandex] Выполнение поискового запроса: '{query}' (Регион: {self.region_id})")
+        
+        params = {
+            "user": self.user,
+            "key": self.key,
+            "query": query,
+            "l10n": "ru",
+            "sortby": "rlv",
+            "maxpassages": 2,
+            "groupby": f"attr=d.mode=deep.groups-on-page={limit}",
+            "lr": self.region_id 
+        }
+
+        results = []
+        try:
+            async with session.get(self.endpoint, params=params, timeout=10) as response:
+                if response.status == 200:
+                    xml_data = await response.text()
+                    soup = BeautifulSoup(xml_data, 'xml')
+                    
+                    for idx, group in enumerate(soup.find_all('group'), start=1):
+                        doc = group.find('doc')
+                        if not doc:
+                            continue
+                            
+                        title_node = doc.find('title')
+                        url_node = doc.find('url')
+                        passages_node = doc.find('passages')
+                        
+                        title = title_node.text if title_node else ""
+                        url = url_node.text if url_node else ""
+                        snippet = passages_node.text if passages_node else ""
+                        
+                        # Очистка от XML тегов (например, выделения стронгом)
+                        clean_title = re.sub(r'<[^>]+>', '', title)
+                        clean_snippet = re.sub(r'<[^>]+>', '', snippet)
+
+                        results.append(WebSearchResult(
+                            engine="yandex",
+                            title=clean_title,
+                            url=url,
+                            snippet=clean_snippet,
+                            position=idx
+                        ))
+        except Exception as e:
+            logger.error(f"[Yandex] Ошибка парсинга XML: {e}")
+
+        return results
+
+# ==========================================
+# 6. ГЛАВНЫЙ АГРЕГАТОР OSINT РАЗВЕДКИ
+# ==========================================
+class OSINTOrchestrator:
+    """
+    Запускает все поисковики параллельно, собирает данные,
+    удаляет дубликаты и анализирует риск (поиск слов "мошенник", "кидала" и т.д.).
+    """
+    def __init__(self, google_api_key: str = None, yandex_user: str = None, yandex_key: str = None):
+        self.duckduckgo = DuckDuckGoScraper()
+        self.google = GoogleSerperAPI(api_key=google_api_key)
+        self.yandex = YandexXMLAPI(user=yandex_user, key=yandex_key)
+        
+        # Ключевые слова для анализа рисков (Красные флаги)
+        self.risk_keywords = [
+            "мошенник", "кидала", "обман", "скам", "scam", 
+            "не советую", "осторожно", "развод", "перекуп", "скручен"
+        ]
+
+    def _analyze_risk(self, results: List[WebSearchResult]) -> float:
+        """Простейший NLP анализ: чем чаще встречаются слова-маркеры, тем выше риск."""
+        risk_score = 0.0
+        for result in results:
+            text_to_analyze = f"{result.title.lower()} {result.snippet.lower()}"
+            
+            for keyword in self.risk_keywords:
+                if keyword in text_to_analyze:
+                    result.is_suspicious = True
+                    risk_score += 1.5  # Повышаем уровень угрозы
+                    
+        return min(risk_score, 10.0) # Максимум 10 баллов опасности
+
+    async def run_deep_investigation(self, query: str) -> OSINTReport:
+        logger.info(f"=== ЗАПУСК ГЛУБОКОГО OSINT АНАЛИЗА ДЛЯ: '{query}' ===")
+        
+        connector = aiohttp.TCPConnector(limit_per_host=5)
+        async with aiohttp.ClientSession(connector=connector) as session:
+            # Параллельный запуск всех поисковых систем
+            tasks = [
+                self.duckduckgo.search(session, query, limit=5),
+                self.google.search(session, query, limit=5),
+                self.yandex.search(session, query, limit=5)
+            ]
+            
+            search_responses = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            all_results: List[WebSearchResult] = []
+            seen_urls = set()
+            
+            # Слияние результатов и удаление дубликатов ссылок
+            for response in search_responses:
+                if isinstance(response, list):
+                    for item in response:
+                        # Нормализация URL для проверки уникальности
+                        clean_url = item.url.split('?')[0].lower()
+                        if clean_url not in seen_urls:
+                            seen_urls.add(clean_url)
+                            all_results.append(item)
+
+            # Анализ угрозы по собранным сниппетам
+            risk_level = self._analyze_risk(all_results)
+
+            report = OSINTReport(
+                query=query,
+                total_results=len(all_results),
+                results=all_results,
+                risk_score=risk_level
+            )
+            
+            logger.info(f"=== АНАЛИЗ ЗАВЕРШЕН. Найдено уникальных ссылок: {report.total_results}. Уровень риска: {report.risk_score}/10 ===")
+            return report
+
+# ==========================================
+# 7. ТЕСТОВЫЙ ПРОГОН
+# ==========================================
+async def run_osint_test():
+    # Инициализация агрегатора (в проде ключи берутся из secrets_manager)
+    osint = OSINTOrchestrator()
+    
+    # Симулируем поиск номера телефона продавца, чтобы выявить мошенника
+    test_query = "Номер 79991234567 отзывы"
+    
+    report = await osint.run_deep_investigation(test_query)
+    
+    print("\n" + "="*50)
+    print(f"🕵️  OSINT ОТЧЕТ ПО ЗАПРОСУ: {report.query}")
+    print("="*50)
+    print(f"Уровень угрозы (Риск): {report.risk_score}/10.0")
+    print(f"Всего независимых источников: {report.total_results}\n")
+    
+    for item in report.results:
+        warning = "🚨 ПОДОЗРИТЕЛЬНО 🚨" if item.is_suspicious else "✅ Чисто"
+        print(f"[{item.engine.upper()}] {item.title}")
+        print(f"Ссылка: {item.url}")
+        print(f"Сниппет: {item.snippet}")
+        print(f"Статус: {warning}\n")
+
+if __name__ == "__main__":
+    asyncio.run(run_osint_test())
+
+// FILE: backend/engine/olama_engine.py
+import asyncio
+import base64
+import json
+import logging
+import sqlite3
+import os
+import time
+import mimetypes
+from datetime import datetime
+from typing import List, Dict, Any, Optional, Tuple
+
+import aiohttp
+from pydantic import BaseModel, Field
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+import uvicorn
+
+# ==========================================
+# 1. КОНФИГУРАЦИЯ И ЛОГИРОВАНИЕ
+# ==========================================
+os.makedirs("logs", exist_ok=True)
+os.makedirs("data/db", exist_ok=True)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+    handlers=[
+        logging.FileHandler("logs/ollama_engine.log"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger("VisionChatEngine")
+
+# ==========================================
+# 2. PYDANTIC МОДЕЛИ (СТРОГАЯ ТИПИЗАЦИЯ)
+# ==========================================
+class ChatMessage(BaseModel):
+    role: str = Field(..., pattern="^(system|user|assistant)$")
+    content: str
+    images: Optional[List[str]] = None  # Base64 строки
+    timestamp: float = Field(default_factory=time.time)
+
+class ChatSession(BaseModel):
+    session_id: str
+    item_id: str
+    user_id: str
+    created_at: float = Field(default_factory=time.time)
+    messages: List[ChatMessage] = Field(default_factory=list)
+
+class VisionAnalysisRequest(BaseModel):
+    user_id: str
+    item_id: str
+    category: str  # "auto", "tech", "clothes", etc.
+    description: str
+    image_url: str
+
+class ChatRequest(BaseModel):
+    session_id: str
+    message: str
+
+# ==========================================
+# 3. БАЗА ДАННЫХ (УПРАВЛЕНИЕ КОНТЕКСТОМ ЧАТОВ)
+# ==========================================
+class DatabaseManager:
+    """Локальная SQLite база для хранения истории чатов с ИИ и отчетов."""
+    
+    def __init__(self, db_path: str = "data/db/vision_chats.sqlite"):
+        self.db_path = db_path
+        self._init_db()
+
+    def _init_db(self):
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS chat_sessions (
+                    session_id TEXT PRIMARY KEY,
+                    item_id TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    created_at REAL NOT NULL
+                )
+            """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT,
+                    role TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    has_images BOOLEAN NOT NULL,
+                    timestamp REAL NOT NULL,
+                    FOREIGN KEY(session_id) REFERENCES chat_sessions(session_id)
+                )
+            """)
+            # Отдельная таблица для хранения base64 картинок, чтобы не грузить основную
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS message_images (
+                    message_id INTEGER,
+                    image_base64 TEXT NOT NULL,
+                    FOREIGN KEY(message_id) REFERENCES messages(id)
+                )
+            """)
+            conn.commit()
+            logger.info("База данных контекста инициализирована.")
+
+    def create_session(self, session_id: str, item_id: str, user_id: str):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO chat_sessions (session_id, item_id, user_id, created_at) VALUES (?, ?, ?, ?)",
+                (session_id, item_id, user_id, time.time())
+            )
+            conn.commit()
+
+    def add_message(self, session_id: str, message: ChatMessage):
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            has_images = bool(message.images)
+            cursor.execute(
+                "INSERT INTO messages (session_id, role, content, has_images, timestamp) VALUES (?, ?, ?, ?, ?)",
+                (session_id, message.role, message.content, has_images, message.timestamp)
+            )
+            message_id = cursor.lastrowid
+            
+            if has_images and message.images:
+                for img_b64 in message.images:
+                    cursor.execute(
+                        "INSERT INTO message_images (message_id, image_base64) VALUES (?, ?)",
+                        (message_id, img_b64)
+                    )
+            conn.commit()
+
+    def get_session_history(self, session_id: str, limit: int = 10) -> List[dict]:
+        """Извлекает последние N сообщений для передачи в контекст Ollama."""
+        history = []
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT id, role, content, has_images FROM messages WHERE session_id = ? ORDER BY timestamp ASC LIMIT ?",
+                (session_id, limit)
+            )
+            rows = cursor.fetchall()
+            
+            for row in rows:
+                msg_id, role, content, has_images = row
+                msg_dict = {"role": role, "content": content}
+                
+                if has_images:
+                    cursor.execute("SELECT image_base64 FROM message_images WHERE message_id = ?", (msg_id,))
+                    images = [img[0] for img in cursor.fetchall()]
+                    if images:
+                        msg_dict["images"] = images
+                
+                history.append(msg_dict)
+        return history
+
+# ==========================================
+# 4. ДВИЖОК ОПТИМИЗАЦИИ ИЗОБРАЖЕНИЙ
+# ==========================================
+class ImageProcessor:
+    @staticmethod
+    async def download_and_encode(url: str) -> Optional[str]:
+        """Асинхронное скачивание с защитой от 'битых' ссылок и таймаутов."""
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as response:
+                    if response.status != 200:
+                        logger.error(f"Ошибка загрузки фото: {response.status} для {url}")
+                        return None
+                    
+                    content_type = response.headers.get('Content-Type', '')
+                    if not content_type.startswith('image/'):
+                        logger.error(f"URL не является изображением: {content_type}")
+                        return None
+
+                    image_bytes = await response.read()
+                    
+                    # Защита от слишком больших файлов (Ollama может упасть по OOM)
+                    if len(image_bytes) > 5 * 1024 * 1024:  # > 5 MB
+                        logger.warning("Изображение слишком велико. В продакшене здесь нужен ресайз через Pillow.")
+                        # TODO: Добавить интеграцию с PIL для ресайза до 1024x1024
+                        
+                    return base64.b64encode(image_bytes).decode('utf-8')
+        except asyncio.TimeoutError:
+            logger.error(f"Таймаут при скачивании {url}")
+        except Exception as e:
+            logger.error(f"Системная ошибка сети при загрузке фото: {e}")
+        return None
+
+# ==========================================
+# 5. OLLAMA API КЛИЕНТ (ПРЯМЫЕ ЗАПРОСЫ)
+# ==========================================
+class OllamaClient:
+    """Прямой HTTP-клиент к демону Ollama для полного контроля над запросами."""
+    
+    def __init__(self, host: str = "http://127.0.0.1:11434", model: str = "llava:latest"):
+        self.host = host
+        self.model = model
+
+    async def _request(self, endpoint: str, payload: dict) -> dict:
+        url = f"{self.host}{endpoint}"
+        async with aiohttp.ClientSession() as session:
+            try:
+                async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=120)) as response:
+                    response.raise_for_status()
+                    return await response.json()
+            except Exception as e:
+                logger.error(f"Ошибка связи с Ollama демоном: {e}")
+                raise
+
+    async def ensure_model(self):
+        """Проверяет локальный кэш Ollama на наличие нужной vision-модели."""
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(f"{self.host}/api/tags") as response:
+                    data = await response.json()
+                    models = [m["name"] for m in data.get("models", [])]
+                    
+            if self.model not in models:
+                logger.info(f"Модель {self.model} не найдена. Отправка команды pull...")
+                # Pull-запрос может выполняться долго, запускаем стриминг
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(f"{self.host}/api/pull", json={"name": self.model}) as resp:
+                        async for chunk in resp.content.iter_any():
+                            pass # Пропускаем прогресс-бар в логах
+                logger.info("Модель успешно загружена.")
+        except Exception as e:
+            logger.error(f"Сбой инициализации модели {self.model}: {e}")
+
+    async def chat_completion(self, messages: List[dict], json_format: bool = False) -> str:
+        """Отправляет массив сообщений (с картинками) в модель и возвращает текст."""
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "stream": False,
+            "options": {
+                "temperature": 0.2, # Низкая температура для аналитики
+                "top_p": 0.9
+            }
+        }
+        if json_format:
+            payload["format"] = "json"
+
+        response_data = await self._request("/api/chat", payload)
+        return response_data.get("message", {}).get("content", "")
+
+# ==========================================
+# 6. ЯДРО БИЗНЕС-ЛОГИКИ (VISION + CHAT)
+# ==========================================
+class VisionChatEngine:
+    def __init__(self):
+        self.db = DatabaseManager()
+        self.ollama = OllamaClient(model="llava:latest")
+        
+    def _get_system_prompt(self, category: str) -> str:
+        """Динамические промпты для разных категорий товаров."""
+        prompts = {
+            "auto": (
+                "Ты профессиональный автоподборщик и эксперт-криминалист. "
+                "Изучи фотографию автомобиля и описание продавца. "
+                "Твоя цель - найти несоответствия, скрытые дефекты, ржавчину, зазоры, признаки ДТП. "
+                "ОТВЕТЬ СТРОГО В JSON: {\"is_approved\": true/false, \"critical_defects\": [\"список\"], \"summary\": \"Вердикт\"}"
+            ),
+            "tech": (
+                "Ты эксперт по б/у электронике. Оцени состояние устройства на фото. "
+                "Ищи сколы, царапины на экранах, вздутые батареи, следы вскрытия. "
+                "ОТВЕТЬ СТРОГО В JSON: {\"is_approved\": true/false, \"critical_defects\": [\"список\"], \"summary\": \"Вердикт\"}"
+            )
+        }
+        return prompts.get(category, "Изучи фото и описание. ОТВЕТЬ В JSON: {\"is_approved\": true/false, \"summary\": \"Вердикт\"}")
+
+    async def initial_vision_analysis(self, request: VisionAnalysisRequest) -> dict:
+        """
+        Первичный прогон: скачиваем фото, создаем сессию чата, 
+        просим ИИ выдать JSON-отчет и сохраняем всё в БД.
+        """
+        base64_image = await ImageProcessor.download_and_encode(request.image_url)
+        if not base64_image:
+            raise HTTPException(status_code=400, detail="Не удалось загрузить или обработать изображение")
+
+        session_id = f"session_{request.item_id}_{int(time.time())}"
+        self.db.create_session(session_id, request.item_id, request.user_id)
+
+        # 1. Системный промпт
+        system_msg = ChatMessage(role="system", content=self._get_system_prompt(request.category))
+        self.db.add_message(session_id, system_msg)
+
+        # 2. Сообщение пользователя (Описание + Картинка)
+        user_content = f"Описание продавца: '{request.description}'. Проанализируй прикрепленное фото."
+        user_msg = ChatMessage(role="user", content=user_content, images=[base64_image])
+        self.db.add_message(session_id, user_msg)
+
+        # 3. Вызов ИИ
+        history = self.db.get_session_history(session_id)
+        raw_response = await self.ollama.chat_completion(history, json_format=True)
+
+        try:
+            parsed_json = json.loads(raw_response)
+        except json.JSONDecodeError:
+            logger.error(f"Ожидался JSON, получено: {raw_response}")
+            parsed_json = {"is_approved": False, "summary": "Ошибка парсинга ответа ИИ", "critical_defects": []}
+
+        # 4. Сохраняем ответ ИИ в контекст
+        ai_msg = ChatMessage(role="assistant", content=json.dumps(parsed_json, ensure_ascii=False))
+        self.db.add_message(session_id, ai_msg)
+
+        return {
+            "session_id": session_id,
+            "analysis": parsed_json
+        }
+
+    async def continue_chat(self, request: ChatRequest) -> str:
+        """
+        Продолжение диалога. Пользователь задает вопрос по конкретному товару.
+        ИИ отвечает, учитывая предыдущие сообщения и фотографию из базы.
+        """
+        # Проверяем существование истории
+        history = self.db.get_session_history(request.session_id)
+        if not history:
+            raise HTTPException(status_code=404, detail="Сессия не найдена")
+
+        # Добавляем новый вопрос
+        new_user_msg = ChatMessage(role="user", content=request.message)
+        self.db.add_message(request.session_id, new_user_msg)
+
+        # Подтягиваем актуальную историю (уже с новым вопросом)
+        # Если история огромная, SQLite отдаст только лимит, но первую фотку нужно сохранить в контексте
+        updated_history = self.db.get_session_history(request.session_id, limit=15)
+        
+        logger.info(f"Запрос к ИИ в рамках сессии {request.session_id}. Вопрос: {request.message}")
+        
+        # Вызываем ИИ (уже без требования JSON, это обычный чат)
+        ai_response_text = await self.ollama.chat_completion(updated_history, json_format=False)
+
+        # Сохраняем ответ
+        new_ai_msg = ChatMessage(role="assistant", content=ai_response_text)
+        self.db.add_message(request.session_id, new_ai_msg)
+
+        return ai_response_text
+
+# ==========================================
+# 7. FASTAPI РОУТЕР (МИКРОСЕРВИС)
+# ==========================================
+app = FastAPI(title="Vision AI Microservice", version="2.0")
+engine = VisionChatEngine()
+
+@app.on_event("startup")
+async def startup_event():
+    logger.info("Проверка локальной ИИ модели...")
+    await engine.ollama.ensure_model()
+
+@app.post("/api/v1/analyze")
+async def analyze_item(request: VisionAnalysisRequest):
+    """Эндпоинт для первичного жесткого анализа объявления с маркетплейса."""
+    try:
+        result = await engine.initial_vision_analysis(request)
+        return result
+    except Exception as e:
+        logger.error(f"Сбой в /analyze: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/v1/chat")
+async def chat_with_ai(request: ChatRequest):
+    """Эндпоинт для текстового общения с ИИ о найденном товаре."""
+    try:
+        reply = await engine.continue_chat(request)
+        return {"session_id": request.session_id, "reply": reply}
+    except Exception as e:
+        logger.error(f"Сбой в /chat: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/v1/history/{session_id}")
+async def get_history(session_id: str):
+    """Выгрузка истории переписки для отображения в мобильном приложении."""
+    history = engine.db.get_session_history(session_id)
+    # Вырезаем тяжелые base64 картинки перед отправкой на фронт
+    for msg in history:
+        msg.pop("images", None)
+    return {"session_id": session_id, "messages": history}
+
+# ==========================================
+# 8. ЗАПУСК И ЭМУЛЯЦИЯ (ДЛЯ ТЕСТОВ)
+# ==========================================
+async def local_simulation():
+    """Тестовый прогон ядра без поднятия FastAPI сервера."""
+    test_engine = VisionChatEngine()
+    await test_engine.ollama.ensure_model()
+    
+    logger.info("--- 1. ПЕРВИЧНЫЙ АНАЛИЗ (АВТО В УЛЬЯНОВСКЕ) ---")
+    mock_request = VisionAnalysisRequest(
+        user_id="usr_888",
+        item_id="avito_777",
+        category="auto",
+        description="Машина в идеале. Ездил дедушка за хлебом. Без ДТП.",
+        # Имитация битой машины
+        image_url="https://upload.wikimedia.org/wikipedia/commons/thumb/1/1a/Dodge_Charger_wrecked.jpg/800px-Dodge_Charger_wrecked.jpg"
+    )
+    
+    analysis_result = await test_engine.initial_vision_analysis(mock_request)
+    session_id = analysis_result["session_id"]
+    print(f"\n[Анализ JSON]:\n{json.dumps(analysis_result['analysis'], indent=2, ensure_ascii=False)}")
+    
+    logger.info("--- 2. ЧАТ С ИИ ПО ЭТОЙ ЖЕ ФОТОГРАФИИ ---")
+    chat_req = ChatRequest(
+        session_id=session_id,
+        message="Ты уверен, что с машиной проблемы? Опиши подробнее, что конкретно сломано на передней части?"
+    )
+    
+    reply = await test_engine.continue_chat(chat_req)
+    print(f"\n[Ответ ИИ в чате]:\n{reply}\n")
+
+
+if __name__ == "__main__":
+    import sys
+    # Если запустить файл с флагом --server, поднимется полноценный FastAPI
+    if len(sys.argv) > 1 and sys.argv[1] == "--server":
+        uvicorn.run(app, host="0.0.0.0", port=8000)
+    else:
+        # Иначе просто прогоняем симуляцию
+        asyncio.run(local_simulation())
+
+
+// FILE: backend/engine/public.py
+import asyncio
+import aiohttp
+import logging
+from typing import Dict, Any, Optional, List
+from pydantic import BaseModel, Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# ==========================================
+# 1. КОНФИГУРАЦИЯ И ЛОГИРОВАНИЕ
+# ==========================================
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s'
+)
+logger = logging.getLogger("PublicAPIEngine")
+
+class PublicAPIConfig(BaseSettings):
+    """
+    Матрица настроек для публичных API (на базе github.com/public-apis/public-apis).
+    """
+    # 1. Автомобили (VIN Decoding) - NHTSA (Бесплатно, без ключа)
+    NHTSA_BASE_URL: str = "https://vpic.nhtsa.dot.gov/api/vehicles/DecodeVinValues/"
+    
+    # 2. Финансы и Валюты - ExchangeRate-API (Есть мощный бесплатный тир)
+    EXCHANGERATE_API_KEY: Optional[str] = Field(default=None, description="Ключ для конвертации цен")
+    
+    # 3. OSINT и Безопасность - HaveIBeenPwned (Проверка сливов продавца)
+    HIBP_API_KEY: Optional[str] = Field(default=None, description="Ключ HIBP для проверки email/телефонов")
+    
+    # 4. Геолокация - OpenStreetMap / Nominatim (Абсолютно бесплатно, требует User-Agent)
+    NOMINATIM_USER_AGENT: str = "MarketVision_OSINT_Scanner/2.0 (contact@marketvision.local)"
+    
+    # 5. IP и Сеть (Определение прокси продавца)
+    IPINFO_TOKEN: Optional[str] = Field(default=None)
+
+    model_config = SettingsConfigDict(env_file='.env', extra='ignore')
+
+# Инициализация конфига
+public_config = PublicAPIConfig()
+
+# ==========================================
+# 2. СТРОГИЕ МОДЕЛИ ДАННЫХ
+# ==========================================
+class VINDecodedData(BaseModel):
+    vin: str
+    make: str
+    model: str
+    year: str
+    manufacturer: str
+    plant_country: str
+    error_code: str = ""
+
+class OSINTLeakReport(BaseModel):
+    target: str
+    is_pwned: bool
+    breaches: List[str] = Field(default_factory=list)
+    risk_level: str = "LOW"
+
+class CurrencyRates(BaseModel):
+    base_code: str
+    rates: Dict[str, float]
+    last_updated: str
+
+# ==========================================
+# 3. БЕСПЛАТНЫЙ ДЕКОДЕР VIN (NHTSA)
+# ==========================================
+class NHTSAVinDecoder:
+    """
+    Декодирует VIN-код через базу Министерства транспорта США. 
+    Работает для большинства мировых автомобилей. Не расходует платные лимиты ГИБДД.
+    """
+    def __init__(self):
+        self.endpoint = public_config.NHTSA_BASE_URL
+
+    async def decode(self, session: aiohttp.ClientSession, vin: str) -> Optional[VINDecodedData]:
+        if not vin or len(vin) != 17:
+            logger.error(f"[NHTSA] Некорректный VIN-код: {vin}")
+            return None
+
+        url = f"{self.endpoint}{vin}?format=json"
+        logger.info(f"[NHTSA] Бесплатная расшифровка VIN: {vin}")
+        
+        try:
+            async with session.get(url, timeout=10) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    results = data.get("Results", [])
+                    if results:
+                        car = results[0]
+                        return VINDecodedData(
+                            vin=vin,
+                            make=car.get("Make", "Unknown"),
+                            model=car.get("Model", "Unknown"),
+                            year=car.get("ModelYear", "Unknown"),
+                            manufacturer=car.get("Manufacturer", "Unknown"),
+                            plant_country=car.get("PlantCountry", "Unknown"),
+                            error_code=car.get("ErrorCode", "")
+                        )
+                else:
+                    logger.warning(f"[NHTSA] Ошибка API: {response.status}")
+        except Exception as e:
+            logger.error(f"[NHTSA] Сбой сети при декодировании VIN: {e}")
+        return None
+
+# ==========================================
+# 4. БЕСПЛАТНЫЙ ГЕОКОДЕР (NOMINATIM / OSM)
+# ==========================================
+class OpenStreetMapGeocoder:
+    """
+    Используется как fallback (запасной вариант), если платный Dadata упал или кончились лимиты.
+    Позволяет определить точные координаты города для поиска по радиусу на Авито.
+    """
+    def __init__(self):
+        self.endpoint = "https://nominatim.openstreetmap.org/search"
+        self.headers = {"User-Agent": public_config.NOMINATIM_USER_AGENT}
+
+    async def get_coordinates(self, session: aiohttp.ClientSession, city_name: str) -> Optional[Dict[str, float]]:
+        params = {
+            "q": city_name,
+            "format": "json",
+            "limit": 1
+        }
+        logger.info(f"[Nominatim] Поиск координат для: {city_name}")
+        
+        try:
+            async with session.get(self.endpoint, params=params, headers=self.headers, timeout=10) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    if data:
+                        return {
+                            "lat": float(data[0]["lat"]),
+                            "lon": float(data[0]["lon"]),
+                            "display_name": data[0]["display_name"]
+                        }
+        except Exception as e:
+            logger.error(f"[Nominatim] Сбой геокодирования: {e}")
+        return None
+
+# ==========================================
+# 5. OSINT ПРОБИВ УТЕЧЕК (HAVE I BEEN PWNED)
+# ==========================================
+class HaveIBeenPwnedAPI:
+    """
+    Проверяет, сливался ли контакт продавца в базах данных.
+    Если почта или номер продавца засветились в базах мошенников, мы повышаем риск-скор.
+    """
+    def __init__(self):
+        self.endpoint = "https://haveibeenpwned.com/api/v3/breachedaccount/"
+        self.api_key = public_config.HIBP_API_KEY
+
+    async def check_leak(self, session: aiohttp.ClientSession, account: str) -> OSINTLeakReport:
+        if not self.api_key:
+            logger.warning("[HIBP] Ключ не настроен, OSINT проверка утечек пропущена.")
+            return OSINTLeakReport(target=account, is_pwned=False)
+
+        headers = {
+            "hibp-api-key": self.api_key,
+            "User-Agent": public_config.NOMINATIM_USER_AGENT
+        }
+        
+        # HIBP требует задержку между запросами
+        await asyncio.sleep(1.5)
+        
+        try:
+            async with session.get(f"{self.endpoint}{account}?truncateResponse=false", headers=headers, timeout=10) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    breaches = [breach["Name"] for breach in data]
+                    risk = "HIGH" if len(breaches) > 3 else "MEDIUM"
+                    return OSINTLeakReport(target=account, is_pwned=True, breaches=breaches, risk_level=risk)
+                elif response.status == 404:
+                    # 404 означает, что утечек не найдено - это хороший знак
+                    return OSINTLeakReport(target=account, is_pwned=False)
+                elif response.status == 429:
+                    logger.warning("[HIBP] Превышен лимит запросов (Rate Limit).")
+        except Exception as e:
+            logger.error(f"[HIBP] Ошибка при проверке {account}: {e}")
+            
+        return OSINTLeakReport(target=account, is_pwned=False)
+
+# ==========================================
+# 6. ВАЛЮТНЫЙ КОНВЕРТЕР (EXCHANGERATE-API)
+# ==========================================
+class GlobalCurrencyConverter:
+    """
+    Необходим для трекинга цен на зарубежных площадках (Amazon, AliExpress)
+    и приведения их к рублю в реальном времени.
+    """
+    def __init__(self):
+        self.api_key = public_config.EXCHANGERATE_API_KEY
+        self.base_url = f"https://v6.exchangerate-api.com/v6/{self.api_key}/latest/"
+
+    async def get_rates(self, session: aiohttp.ClientSession, base_currency: str = "USD") -> Optional[CurrencyRates]:
+        if not self.api_key:
+            logger.warning("[Currency] Ключ ExchangeRate не задан.")
+            return None
+
+        try:
+            async with session.get(f"{self.base_url}{base_currency}", timeout=10) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    return CurrencyRates(
+                        base_code=base_currency,
+                        rates=data.get("conversion_rates", {}),
+                        last_updated=data.get("time_last_update_utc", "")
+                    )
+        except Exception as e:
+            logger.error(f"[Currency] Ошибка получения курсов валют: {e}")
+        return None
+
+# ==========================================
+# 7. ГЛАВНЫЙ АГРЕГАТОР ПУБЛИЧНЫХ API
+# ==========================================
+class PublicAPIEngine:
+    """
+    Оркестратор, который связывает все публичные микросервисы в единый узел.
+    Идеально встраивается в наш монолит как дополнительный модуль обогащения данных.
+    """
+    def __init__(self):
+        self.vin_decoder = NHTSAVinDecoder()
+        self.geocoder = OpenStreetMapGeocoder()
+        self.leak_checker = HaveIBeenPwnedAPI()
+        self.currency = GlobalCurrencyConverter()
+
+    async def enrich_listing_data(self, vin: str = None, city: str = None, seller_contact: str = None) -> Dict[str, Any]:
+        """
+        Метод обогащения: принимает сырые данные из парсера и прогоняет их по бесплатным публичным API.
+        """
+        logger.info("=== Запуск обогащения данных через Public APIs ===")
+        report = {}
+        
+        connector = aiohttp.TCPConnector(limit_per_host=5)
+        async with aiohttp.ClientSession(connector=connector) as session:
+            tasks = []
+            
+            # Если есть VIN, запрашиваем детали авто
+            if vin:
+                tasks.append(self.vin_decoder.decode(session, vin))
+            else:
+                tasks.append(asyncio.sleep(0)) # Заглушка для индекса
+                
+            # Если есть город, ищем координаты для карты
+            if city:
+                tasks.append(self.geocoder.get_coordinates(session, city))
+            else:
+                tasks.append(asyncio.sleep(0))
+                
+            # Если есть контакт, проверяем на OSINT утечки
+            if seller_contact:
+                tasks.append(self.leak_checker.check_leak(session, seller_contact))
+            else:
+                tasks.append(asyncio.sleep(0))
+
+            # Выполняем все запросы параллельно
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            # Парсинг результатов
+            if vin and isinstance(results[0], VINDecodedData):
+                report["vehicle_specs"] = results[0].model_dump()
+                
+            if city and isinstance(results[1], dict):
+                report["geo_data"] = results[1]
+                
+            if seller_contact and isinstance(results[2], OSINTLeakReport):
+                report["seller_osint_risk"] = results[2].model_dump()
+
+        logger.info("=== Обогащение завершено ===")
+        return report
+
+# ==========================================
+# 8. БЛОК ТЕСТИРОВАНИЯ И СИМУЛЯЦИИ
+# ==========================================
+async def test_public_apis():
+    engine = PublicAPIEngine()
+    
+    # Симуляция найденного объявления на Авито
+    mock_scraped_data = {
+        "vin": "5UXWX7C5*BA******", # Тестовый VIN BMW
+        "city": "Ульяновск",
+        "seller_contact": "test_scammer@example.com"
+    }
+    
+    print("\n" + "="*50)
+    print("🚀 ИНТЕГРАЦИЯ С PUBLIC APIS")
+    print("="*50)
+    
+    enriched_data = await engine.enrich_listing_data(
+        vin=mock_scraped_data["vin"],
+        city=mock_scraped_data["city"],
+        seller_contact=mock_scraped_data["seller_contact"]
+    )
+    
+    import json
+    print(json.dumps(enriched_data, indent=4, ensure_ascii=False))
+
+if __name__ == "__main__":
+    asyncio.run(test_public_apis())
+
+
+// FILE: backend/main.py
+"""
+================================================================================
+OmniScan CORE ENGINE (v4.0.0 - ULTIMATE ENTERPRISE RELEASE)
+================================================================================
+Описание: Главный сервер приложения OmniScan.
+Функционал:
+  - Продвинутый REST API для запуска OSINT-матриц.
+  - Асинхронный HTTP-движок (aiohttp) для реального парсинга API.
+  - Rate Limiter (Token Bucket) для защиты от DDoS.
+  - WebSockets (Чат + AI) с аппаратной фильтрацией эмодзи.
+  - Неблокирующая работа с базой данных (SQLite).
+================================================================================
+"""
+
+import asyncio
+import os
+import re
+import json
+import sqlite3
+import logging
+import time
+from datetime import datetime
+from typing import Dict, List, Optional, Any
+from urllib.parse import urlparse
+
+import aiohttp
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, BackgroundTasks, HTTPException, Depends, Header, status
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+import uvicorn
+
+# ==========================================
+# 1. КОНФИГУРАЦИЯ И БАЗА ДАННЫХ
+# ==========================================
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] OmniScan-Core: %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger("OmniScan")
+
+# Ключ по умолчанию для тестов (в проде выносить в .env)
+SECRET_API_KEY = os.getenv("OMNISCAN_API_KEY", "omniscan_master_key_2026")
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "omniscan_data.db")
+
+app = FastAPI(
+    title="OmniScan API", 
+    description="Универсальный OSINT-сканер и анализатор рынка", 
+    version="4.0.0",
+    docs_url="/api/docs"
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], # В продакшене заменить на домен GitHub Pages
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+def init_db():
+    """Инициализация расширенной структуры базы данных."""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    # Таблица ЧС
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS blacklist (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            target_id TEXT UNIQUE,
+            platform TEXT,
+            reason TEXT,
+            risk_level TEXT DEFAULT 'HIGH',
+            added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    # Таблица логов сканирования
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS scan_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            query TEXT,
+            pipeline TEXT,
+            status TEXT,
+            execution_time_ms INTEGER,
+            scanned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    # Таблица системных ошибок API
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS api_errors (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            api_endpoint TEXT,
+            error_msg TEXT,
+            occurred_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    conn.commit()
+    conn.close()
+    logger.info("База данных OmniScan успешно инициализирована.")
+
+init_db()
+
+# ==========================================
+# 2. RATE LIMITER (ЗАЩИТА ОТ DDoS И СПАМА)
+# ==========================================
+class RateLimiter:
+    """Алгоритм Token Bucket для ограничения количества запросов."""
+    def __init__(self, capacity: int, fill_rate: float):
+        self.capacity = capacity
+        self.fill_rate = fill_rate
+        self.clients: Dict[str, Dict[str, float]] = {}
+
+    def is_allowed(self, client_id: str) -> bool:
+        now = time.time()
+        if client_id not in self.clients:
+            self.clients[client_id] = {"tokens": self.capacity, "last_update": now}
+        
+        client = self.clients[client_id]
+        # Пополняем токены
+        elapsed = now - client["last_update"]
+        client["tokens"] = min(self.capacity, client["tokens"] + elapsed * self.fill_rate)
+        client["last_update"] = now
+        
+        if client["tokens"] >= 1:
+            client["tokens"] -= 1
+            return True
+        return False
+
+# Ограничение: 5 запросов в секунду на 1 IP
+limiter = RateLimiter(capacity=5, fill_rate=1.0)
+
+async def check_rate_limit(request: Request):
+    client_ip = request.client.host if request.client else "unknown"
+    if not limiter.is_allowed(client_ip):
+        logger.warning(f"Rate limit превышен для IP: {client_ip}")
+        raise HTTPException(status_code=429, detail="Too Many Requests")
+
+# Зависимость для авторизации
+async def verify_api_key(x_api_key: str = Header(default="")):
+    if x_api_key != SECRET_API_KEY:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid or missing API Key")
+    return x_api_key
+
+# ==========================================
+# 3. АСИНХРОННЫЙ OSINT ДВИЖОК (ПАРСЕР)
+# ==========================================
+class OmniScanEngine:
+    """Боевой движок для выполнения реальных HTTP запросов по матрице."""
+    
+    @staticmethod
+    async def fetch_api(session: aiohttp.ClientSession, url: str, method: str = "GET", headers: dict = None) -> Dict[str, Any]:
+        """Универсальный метод для безопасного запроса к публичным API."""
+        start_time = time.time()
+        try:
+            async with session.request(method, url, headers=headers, timeout=10) as response:
+                resp_text = await response.text()
+                try:
+                    data = json.loads(resp_text)
+                except json.JSONDecodeError:
+                    data = {"raw_text": resp_text[:500]} # Если ответ не JSON (например HTML), берем кусок
+                
+                return {
+                    "status_code": response.status,
+                    "success": 200 <= response.status < 300,
+                    "data": data,
+                    "ms": int((time.time() - start_time) * 1000)
+                }
+        except Exception as e:
+            logger.error(f"Сбой сети при запросе к {url}: {e}")
+            # Запись ошибки в БД (через thread чтобы не блокировать loop)
+            asyncio.create_task(OmniScanEngine.log_error(url, str(e)))
+            return {"success": False, "error": str(e), "ms": int((time.time() - start_time) * 1000)}
+
+    @staticmethod
+    async def log_error(endpoint: str, msg: str):
+        def _write():
+            conn = sqlite3.connect(DB_PATH)
+            conn.cursor().execute("INSERT INTO api_errors (api_endpoint, error_msg) VALUES (?, ?)", (endpoint, msg))
+            conn.commit()
+            conn.close()
+        await asyncio.to_thread(_write)
+
+    @staticmethod
+    async def log_scan(query: str, pipeline: str, status: str, exec_time: int):
+        def _write():
+            conn = sqlite3.connect(DB_PATH)
+            conn.cursor().execute(
+                "INSERT INTO scan_logs (query, pipeline, status, execution_time_ms) VALUES (?, ?, ?, ?)", 
+                (query, pipeline, status, exec_time)
+            )
+            conn.commit()
+            conn.close()
+        await asyncio.to_thread(_write)
+
+    @classmethod
+    async def run_pipeline(cls, target: str, pipeline_name: str):
+        """Реальное выполнение задач. В проде здесь читается JSON матрица."""
+        logger.info(f"OSINT ДВИЖОК: Старт пайплайна '{pipeline_name}' для цели '{target}'")
+        start_time = time.time()
+        
+        results = {"target": target, "pipeline": pipeline_name, "stages": {}}
+        
+        # Настраиваем коннектор для оптимизации соединений
+        connector = aiohttp.TCPConnector(limit_per_host=10, ssl=False)
+        async with aiohttp.ClientSession(connector=connector) as session:
+            
+            # ЭМУЛЯЦИЯ ЛОГИКИ МАТРИЦЫ (Здесь мы делаем реальные запросы к публичным API)
+            if pipeline_name == "auto_ru_market":
+                # Запрос 1: Пытаемся расшифровать как VIN через бесплатный NHTSA
+                logger.info("Запуск проверки через NHTSA API...")
+                nhtsa_url = f"https://vpic.nhtsa.dot.gov/api/vehicles/DecodeVinValues/{target}?format=json"
+                nhtsa_res = await cls.fetch_api(session, nhtsa_url)
+                results["stages"]["vin_decode"] = nhtsa_res
+
+            elif pipeline_name == "tech_global":
+                # Запрос 2: Проверка курсов валют как часть пайплайна техники
+                logger.info("Запуск модуля валют (Frankfurter API)...")
+                fx_url = "https://api.frankfurter.app/latest?from=USD&to=RUB,EUR"
+                fx_res = await cls.fetch_api(session, fx_url)
+                results["stages"]["currency_check"] = fx_res
+
+            elif pipeline_name == "seller_osint":
+                # Запрос 3: Проверка контактов на мошенничество
+                logger.info("Проверка по базам спамеров...")
+                spam_url = f"https://api.stopforumspam.org/api?ip={target}&json"
+                spam_res = await cls.fetch_api(session, spam_url)
+                results["stages"]["spam_check"] = spam_res
+
+            else:
+                logger.warning(f"Пайплайн {pipeline_name} не имеет привязанных API-маршрутов.")
+
+        exec_time_ms = int((time.time() - start_time) * 1000)
+        await cls.log_scan(target, pipeline_name, "COMPLETED", exec_time_ms)
+        
+        # Сохранение сырого дампа в файл
+        os.makedirs("output_data", exist_ok=True)
+        dump_file = f"output_data/omniscan_{int(time.time())}.json"
+        with open(dump_file, "w", encoding="utf-8") as f:
+            json.dump(results, f, ensure_ascii=False, indent=4)
+            
+        logger.info(f"Сбор данных завершен. Время: {exec_time_ms}мс. Дамп: {dump_file}")
+
+# ==========================================
+# 4. СИСТЕМА CHAT & WEBSOCKETS
+# ==========================================
+EMOJI_FILTER = re.compile(r'[^\w\s.,!?"\'\-а-яА-ЯёЁa-zA-Z0-9]', re.UNICODE)
+
+class WsManager:
+    def __init__(self):
+        self.rooms: Dict[str, List[WebSocket]] = {}
+
+    def sanitize(self, text: str) -> str:
+        return EMOJI_FILTER.sub('', text).strip()
+
+    async def connect(self, ws: WebSocket, room: str):
+        await ws.accept()
+        if room not in self.rooms:
+            self.rooms[room] = []
+        self.rooms[room].append(ws)
+
+    def disconnect(self, ws: WebSocket, room: str):
+        if room in self.rooms and ws in self.rooms[room]:
+            self.rooms[room].remove(ws)
+
+    async def broadcast(self, message: str, room: str, sender: str):
+        clean_msg = self.sanitize(message)
+        if not clean_msg: return
+            
+        payload = {"sender": sender, "text": clean_msg, "time": datetime.now().strftime("%H:%M")}
+        for conn in list(self.rooms.get(room, [])):
+            try:
+                await conn.send_json(payload)
+            except Exception:
+                self.disconnect(conn, room)
+
+ws_manager = WsManager()
+
+@app.websocket("/ws/chat/{room}/{username}")
+async def ws_endpoint(websocket: WebSocket, room: str, username: str):
+    await ws_manager.connect(websocket, room)
+    try:
+        while True:
+            data = await websocket.receive_text()
+            if room == "ai":
+                clean = ws_manager.sanitize(data)
+                if not clean: continue
+                # Эмуляция ответа нейросети
+                await asyncio.sleep(1)
+                await websocket.send_json({
+                    "sender": "OmniScan AI",
+                    "text": f"Принято. Анализирую: {clean[:20]}...",
+                    "time": datetime.now().strftime("%H:%M"),
+                    "isAi": True
+                })
+            else:
+                await ws_manager.broadcast(data, room, username)
+    except WebSocketDisconnect:
+        ws_manager.disconnect(websocket, room)
+
+# ==========================================
+# 5. REST API ENDPOINTS
+# ==========================================
+class ScanRequest(BaseModel):
+    target: str = Field(..., min_length=2, description="Цель (VIN, Номер, Город)")
+    pipeline: str = Field(default="auto_ru_market")
+
+class BlacklistData(BaseModel):
+    target_id: str
+    platform: str
+    reason: str
+
+@app.post("/api/v1/scan", dependencies=[Depends(check_rate_limit)])
+async def trigger_scan(req: ScanRequest, bg_tasks: BackgroundTasks, auth: str = Depends(verify_api_key)):
+    """Запуск матрицы OmniScan. Выполняется асинхронно в фоне."""
+    bg_tasks.add_task(OmniScanEngine.run_pipeline, req.target, req.pipeline)
+    return {
+        "status": "processing",
+        "target": req.target,
+        "message": "Задача успешно поставлена в очередь. Движок OmniScan работает."
+    }
+
+@app.post("/api/v1/blacklist", dependencies=[Depends(check_rate_limit)])
+async def add_blacklist(data: BlacklistData, auth: str = Depends(verify_api_key)):
+    """Добавление перекупа в глобальную базу OmniScan."""
+    def _insert():
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        try:
+            cur.execute("INSERT INTO blacklist (target_id, platform, reason) VALUES (?, ?, ?)", 
+                        (data.target_id, data.platform, data.reason))
+            conn.commit()
+            return True, "Добавлено"
+        except sqlite3.IntegrityError:
+            return False, "Уже в ЧС"
+        finally:
+            conn.close()
+            
+    success, msg = await asyncio.to_thread(_insert)
+    if not success:
+        raise HTTPException(status_code=400, detail=msg)
+    return {"status": "success", "message": msg}
+
+@app.get("/api/v1/status")
+async def get_status():
+    """Публичный эндпоинт статуса (без ключа)."""
+    def _stats():
+        conn = sqlite3.connect(DB_PATH)
+        bl_count = conn.cursor().execute("SELECT COUNT(*) FROM blacklist").fetchone()[0]
+        scan_count = conn.cursor().execute("SELECT COUNT(*) FROM scan_logs").fetchone()[0]
+        conn.close()
+        return bl_count, scan_count
+        
+    bl, scans = await asyncio.to_thread(_stats)
+    return {
+        "system": "OmniScan Engine",
+        "version": "4.0.0",
+        "status": "OPERATIONAL",
+        "metrics": {
+            "scammers_blocked": bl,
+            "total_scans_performed": scans,
+            "active_ws_connections": sum(len(c) for c in ws_manager.rooms.values())
+        }
+    }
+
+# ==========================================
+# 6. ТОЧКА ВХОДА
+# ==========================================
+if __name__ == "__main__":
+    logger.info("========================================")
+    logger.info("🔥 OMNISCAN ENGINE BOOT SEQUENCE INIT   ")
+    logger.info("========================================")
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, log_level="warning")
+
+
+// FILE: backend/matrix_executor.py
+import asyncio
+import aiohttp
+import json
+import logging
+import argparse
+import os
+import time
+from typing import Dict, Any, List
+
+# ==========================================
+# 1. КОНФИГУРАЦИЯ И ЦВЕТНОЕ ЛОГИРОВАНИЕ
+# ==========================================
+# Используем продвинутый логгер, чтобы в логах GitHub Actions всё было красиво
+try:
+    import colorlog
+    handler = colorlog.StreamHandler()
+    handler.setFormatter(colorlog.ColoredFormatter(
+        '%(log_color)s%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+        log_colors={
+            'DEBUG': 'cyan',
+            'INFO': 'green',
+            'WARNING': 'yellow',
+            'ERROR': 'red',
+            'CRITICAL': 'red,bg_white',
+        }
+    ))
+    logger = colorlog.getLogger("MatrixExecutor")
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+except ImportError:
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+    logger = logging.getLogger("MatrixExecutor")
+
+# ==========================================
+# 2. ИСПОЛНИТЕЛЬНОЕ ЯДРО (PIPELINE ENGINE)
+# ==========================================
+class PipelineExecutor:
+    """
+    Читает JSON-матрицу и запускает API в правильном порядке.
+    """
+    def __init__(self, matrix_path: str, api_registry_path: str):
+        self.matrix_path = matrix_path
+        self.api_registry_path = api_registry_path
+        self.matrix_data = self._load_json(self.matrix_path)
+        # В проде здесь будет парсер файла api.txt, сейчас для надежности
+        # мы просто маппим ID из JSON на реальные Python функции.
+        self.api_dispatcher = APIDispatcher()
+
+    def _load_json(self, path: str) -> Dict[str, Any]:
+        if not os.path.exists(path):
+            logger.critical(f"Файл матрицы не найден: {path}")
+            raise FileNotFoundError(f"Missing config: {path}")
+        with open(path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+
+    async def _execute_stage(self, session: aiohttp.ClientSession, stage_name: str, tasks_config: List[Dict]):
+        """Выполняет все API-вызовы внутри одной стадии строго параллельно."""
+        logger.info(f"--- Запуск стадии: [ {stage_name.upper()} ] ---")
+        
+        async def run_task(task_cfg: Dict):
+            api_ref = task_cfg.get("api_ref")
+            api_name = task_cfg.get("name")
+            is_critical = task_cfg.get("critical", False)
+            fallback = task_cfg.get("fallback")
+
+            try:
+                # Динамический вызов нужного API через диспетчер
+                result = await self.api_dispatcher.call_api(session, api_ref, api_name)
+                return {"api": api_name, "status": "success", "data": result}
+            except Exception as e:
+                logger.error(f"Сбой API '{api_name}' (REF: {api_ref}): {str(e)}")
+                if fallback:
+                    logger.warning(f"Активация Fallback для '{api_name}' -> Переход на {fallback}")
+                    # Эмуляция вызова запасного API
+                    await asyncio.sleep(1)
+                    return {"api": fallback, "status": "success (fallback)", "data": {}}
+                
+                if is_critical:
+                    logger.critical(f"КРИТИЧЕСКАЯ ОШИБКА: Остановка из-за падения {api_name}")
+                    raise e
+                return {"api": api_name, "status": "failed", "error": str(e)}
+
+        # Запускаем все задачи стадии одновременно
+        coroutines = [run_task(cfg) for cfg in tasks_config]
+        results = await asyncio.gather(*coroutines, return_exceptions=True)
+        
+        # Фильтрация результатов и обработка критических сбоев
+        stage_report = []
+        for res in results:
+            if isinstance(res, Exception):
+                logger.error(f"Необработанное исключение в стадии {stage_name}: {res}")
+            else:
+                stage_report.append(res)
+                
+        return stage_report
+
+    async def run_pipeline(self, pipeline_name: str):
+        """Главный метод запуска конкретного пайплайна."""
+        pipelines = self.matrix_data.get("execution_pipelines", {})
+        
+        if pipeline_name not in pipelines:
+            logger.critical(f"Пайплайн '{pipeline_name}' не найден в матрице!")
+            available = ", ".join(pipelines.keys())
+            logger.info(f"Доступные пайплайны: {available}")
+            return
+
+        pipeline_cfg = pipelines[pipeline_name]
+        logger.info(f"🚀 Инициализация пайплайна: {pipeline_name}")
+        logger.info(f"Описание: {pipeline_cfg.get('description')}")
+        
+        stages = pipeline_cfg.get("stages", {})
+        final_report = {
+            "pipeline": pipeline_name,
+            "timestamp": time.time(),
+            "results": {}
+        }
+
+        # Используем единую сессию для всех запросов с общим пулом коннектов
+        connector = aiohttp.TCPConnector(limit_per_host=20)
+        async with aiohttp.ClientSession(connector=connector) as session:
+            # Стадии должны выполняться последовательно (например, сначала поиск, потом декодинг VIN)
+            # Но внутри стадии задачи выполняются параллельно.
+            for stage_name, tasks_config in stages.items():
+                stage_results = await self._execute_stage(session, stage_name, tasks_config)
+                final_report["results"][stage_name] = stage_results
+
+        # Сохранение финального отчета для GitHub Actions Artifacts
+        output_dir = "output_data"
+        os.makedirs(output_dir, exist_ok=True)
+        report_path = os.path.join(output_dir, f"{pipeline_name}_report.json")
+        
+        with open(report_path, 'w', encoding='utf-8') as f:
+            json.dump(final_report, f, ensure_ascii=False, indent=4)
+            
+        logger.info(f"✅ Пайплайн {pipeline_name} завершен. Отчет сохранен: {report_path}")
+
+# ==========================================
+# 3. ДИСПЕТЧЕР API (СИМУЛЯТОР МАРШРУТИЗАЦИИ)
+# ==========================================
+class APIDispatcher:
+    """
+    Связывает строковые идентификаторы (api_ref) с реальными функциями.
+    В рабочей среде здесь будут импорты классов из engine/public_osint_integrations.py.
+    """
+    async def call_api(self, session: aiohttp.ClientSession, api_ref: str, api_name: str) -> Dict:
+        logger.debug(f"[{api_name}] Отправка запроса (REF: {api_ref})...")
+        
+        # Эмуляция сетевой задержки от 0.5 до 2 секунд
+        await asyncio.sleep(1.0)
+
+        # Моки для разных систем из нашего api.txt
+        if api_ref == "004": # Avito
+            return {"items_found": 150, "platform": "Avito"}
+        elif api_ref == "016": # NHTSA
+            return {"vin_valid": True, "manufacturer": "BMW AG"}
+        elif api_ref == "040": # Ollama Vision
+            return {"is_approved": False, "defect_detected": "Царапина на бампере"}
+        elif api_ref == "049": # HIBP
+            return {"is_pwned": True, "breaches": ["VK.com", "Canva"]}
+        else:
+            return {"status": "ok", "message": f"API {api_ref} executed successfully."}
+
+# ==========================================
+# 4. ТОЧКА ВХОДА (CLI ARGUMENTS)
+# ==========================================
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="MarketVision API Orchestrator Matrix Executor")
+    parser.add_argument(
+        '--pipeline', 
+        type=str, 
+        required=True, 
+        help='Имя пайплайна для запуска (например: pipeline_auto_ru, pipeline_seller_osint)'
+    )
+    parser.add_argument(
+        '--matrix-file', 
+        type=str, 
+        default='../config/orchestrator_matrix.json', 
+        help='Путь к JSON файлу матрицы'
+    )
+    
+    args = parser.parse_args()
+
+    # Фикс путей для локального запуска или запуска из GitHub Actions
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    matrix_absolute_path = os.path.normpath(os.path.join(base_dir, args.matrix_file))
+
+    executor = PipelineExecutor(
+        matrix_path=matrix_absolute_path,
+        api_registry_path=os.path.join(base_dir, '../config/api.txt')
+    )
+    
+    # Запуск асинхронного цикла
+    try:
+        asyncio.run(executor.run_pipeline(args.pipeline))
+    except KeyboardInterrupt:
+        logger.info("Процесс принудительно остановлен пользователем.")
+    except Exception as e:
+        logger.critical(f"Глобальный сбой ядра: {e}")
+        exit(1)
+
+
+// FILE: backend/requirements.txt
+aiohttp==3.9.3
+pydantic==2.6.1
+pydantic-settings==2.1.0
+beautifulsoup4==4.12.3
+lxml==5.1.0
+colorlog==6.8.2
+python-dotenv==1.0.1
+
+
+// FILE: config/api.txt
+================================================================================
+                    MARKETVISION CORE: PUBLIC API REGISTRY
+                       (RU / KZ / US / GLOBAL MARKETS)
+================================================================================
+Версия базы: 2.5.0
+Языковая поддержка: RU / EN
+Формат авторизации:
+  [NO_KEY]    - Полностью бесплатный открытый API без токена
+  [FREE_KEY]  - Требуется бесплатная регистрация для получения API Key
+  [REVERSE]   - Публичные эндпоинты фронтенда/мобильных приложений
+================================================================================
+
+================================================================================
+1. КЛАССИФАЙДЫ, МАРКЕТПЛЕЙСЫ И АВТО-РЫНОК (RU / KZ / US)
+================================================================================
+
+1.1. РОССИЯ (RU)
+001. Wildberries Catalog API [NO_KEY]
+     URL: https://search.wb.ru/exactmatch/ru/common/v4/search
+     Назначение: Поиск товаров, получение цен, остатков, скидок и брендов.
+     Параметры: ?query={query}&dest={city_dest}&priceU={min};{max}&page={page}
+
+002. Wildberries Product Card Details [NO_KEY]
+     URL: https://basket-{shard}.wb.ru/vol{vol}/part{part}/{id}/info/data.json
+     Назначение: Полная информация о товаре, продавце, складах и характеристиках.
+
+003. Ozon Public Search [REVERSE]
+     URL: https://api.ozon.ru/composer-api.bx/page/json/v2
+     Назначение: Поиск товаров на Ozon через открытый эндпоинт мобильного SPA.
+     Параметры: ?url=/category/{category}/?text={query}
+
+004. Avito Mobile Gateway [REVERSE]
+     URL: https://m.avito.ru/api/9/items
+     Назначение: Выгрузка объявлений б/у рынка (авто, электроника) по городам.
+     Параметры: ?locationId={id}&categoryId={cat}&query={query}
+
+005. Drom.ru Auto Search [REVERSE]
+     URL: https://auto.drom.ru/ajax/search/
+     Назначение: Каталог подержанных автомобилей по регионам РФ.
+
+006. DNS Catalog Public Gateway [REVERSE]
+     URL: https://www.dns-shop.ru/catalog/json/
+     Назначение: Мониторинг актуальных цен и наличия техники в розничных магазинах.
+
+1.2. КАЗАХСТАН (KZ)
+007. Kolesa.kz Auto Classifieds [REVERSE]
+     URL: https://kolesa.kz/a/ajax-find-similar/
+     Назначение: Рынок б/у авто Казахстана, цены в тенге (KZT), проверка дубликатов.
+
+008. Kolesa.kz Listing API [REVERSE]
+     URL: https://m.kolesa.kz/ms/car/v1/products/{product_id}
+     Назначение: Полное досье на автомобиль в Казахстане (пробег, VIN, город, продавец).
+
+009. Krisha.kz Real Estate & Goods [REVERSE]
+     URL: https://krisha.kz/a/ajax-analytics/
+     Назначение: Анализ динамики цен и проверка контактных данных продавцов в KZ.
+
+010. Kaspi.kz Storefront Search [REVERSE]
+     URL: https://kaspi.kz/yml/product-view/services/catalog/category/{category_id}
+     Назначение: Главный маркетплейс Казахстана (электроника, бытовые товары, автотовары).
+
+1.3. США И МИРОВОЙ РЫНОК (US / GLOBAL)
+011. eBay Finding API [FREE_KEY]
+     URL: https://svcs.ebay.com/services/search/FindingService/v1
+     Назначение: Поиск б/у и новых товаров на американском и мировом рынке eBay.
+
+012. Craigslist RSS Feeds [NO_KEY]
+     URL: https://{city}.craigslist.org/search/{category}?format=rss
+     Назначение: Сбор локальных б/у объявлений в США без блокировок.
+
+013. FakeStoreAPI [NO_KEY]
+     URL: https://fakestoreapi.com/products
+     Назначение: Мок-каталог для тестирования UI и алгоритмов фильтрации.
+
+014. DummyJSON Products [NO_KEY]
+     URL: https://dummyjson.com/products
+     Назначение: Тестовая база из 100+ товаров с пагинацией, скидками и рейтингом.
+
+015. Platzi Fake Store API [NO_KEY]
+     URL: https://api.escuelajs.co/api/v1/products
+     Назначение: Категоризированная база товаров для стресс-тестов UI.
+
+================================================================================
+2. АВТОМОБИЛИ, VIN И ТРАНСПОРТНЫЙ OSINT (AUTO DOSSIER)
+================================================================================
+
+016. NHTSA VIN Decoder [NO_KEY]
+     URL: https://vpic.nhtsa.dot.gov/api/vehicles/DecodeVinValues/{vin}?format=json
+     Назначение: Глобальная расшифровка VIN (марка, модель, год, завод сборки, мотор).
+
+017. NHTSA Vehicle Recalls API [NO_KEY]
+     URL: https://api.nhtsa.gov/recalls/recallsByVin?vin={vin}
+     Назначение: Проверка отзывных кампаний автопроизводителей по VIN.
+
+018. NHTSA Vehicle Safety Ratings [NO_KEY]
+     URL: https://api.nhtsa.gov/SafetyRatings/modelyear/{year}/make/{make}/model/{model}
+     Назначение: Краш-тесты и рейтинги безопасности моделей авто.
+
+019. CarQuery API [NO_KEY]
+     URL: https://www.carqueryapi.com/api/0.3/
+     Назначение: Полная база технических характеристик машин с 1941 года по сей день.
+
+020. Open Charge Map API [FREE_KEY]
+     URL: https://api.openchargemap.io/v3/poi/
+     Назначение: База зарядных станций для электромобилей (для фильтра электрокаров).
+
+021. Nomerogram Scraper Gateway [REVERSE]
+     URL: https://www.nomerogram.ru/n/{plate}/
+     Назначение: Поиск фотографий машины в прошлом по российским и казахстанским номерам.
+
+022. Gibdd Web Scraper Check [REVERSE]
+     URL: https://check.gibdd.ru/proxy/check/auto/history
+     Назначение: Официальная проверка истории регистраций и периодов владения в РФ.
+
+023. RSA (Rostransnadzor / Insurance check) [REVERSE]
+     URL: https://dkbm-web.autoins.ru/dkbm-web-1.0/policy.htm
+     Назначение: Проверка наличия и истории полисов ОСАГО / КАСКО.
+
+================================================================================
+3. КУРСЫ ВАЛЮТ, ФИНАНСЫ И ЦЕНООБРАЗОВАНИЕ (FX & REGIONAL PRICING)
+================================================================================
+
+024. Frankfurter Currency API [NO_KEY]
+     URL: https://api.frankfurter.app/latest
+     Назначение: Официальные курсы ЕЦБ без ключей (конвертация USD, EUR, RUB, KZT).
+
+025. Central Bank of Russia (CBR) XML [NO_KEY]
+     URL: https://www.cbr.ru/scripts/XML_daily.asp
+     Назначение: Официальный курс валют ЦБ РФ на текущий день в XML.
+
+026. National Bank of Kazakhstan (NBKZ) [NO_KEY]
+     URL: https://nationalbank.kz/rss/rates_all.xml
+     Назначение: Официальные курсы валют Национального Банка Республики Казахстан.
+
+027. ExchangeRate-API [FREE_KEY]
+     URL: https://v6.exchangerate-api.com/v6/{key}/latest/{base}
+     Назначение: Конвертер 160+ мировых валют с обновлением раз в час.
+
+028. Open Exchange Rates [FREE_KEY]
+     URL: https://openexchangerates.org/api/latest.json
+     Назначение: Исторические курсы для построения графиков инфляции цен.
+
+029. CoinGecko Crypto Rates [NO_KEY]
+     URL: https://api.coingecko.com/api/v3/simple/price
+     Назначение: Мониторинг курсов крипты (для покупок через USDT/BTC).
+
+030. CoinCap API [NO_KEY]
+     URL: https://api.coincap.io/v2/assets
+     Назначение: Альтернативный бесплатный источник крипто-котировок в реальном времени.
+
+================================================================================
+4. ГЕОЛОКАЦИЯ, КАРТЫ И IP-АНАЛИТИКА (GEO INTELLIGENCE)
+================================================================================
+
+031. OpenStreetMap Nominatim Geocoding [NO_KEY]
+     URL: https://nominatim.openstreetmap.org/search
+     Назначение: Прямое геокодирование городов РФ, KZ и мира (получение координат).
+
+032. Nominatim Reverse Geocoding [NO_KEY]
+     URL: https://nominatim.openstreetmap.org/reverse
+     Назначение: Получение адреса и города по GPS координатам (lat/lon).
+
+033. DaData Clean Address [FREE_KEY]
+     URL: https://cleaner.dadata.ru/api/v1/clean/address
+     Назначение: Стандартизация адресов и городов РФ/СНГ по КЛАДР/ФИАС.
+
+034. IP-API.com [NO_KEY]
+     URL: http://ip-api.com/json/{ip}
+     Назначение: Определение города пользователя по IP без ключей (лимит 45 req/min).
+
+035. IPInfo.io [FREE_KEY]
+     URL: https://ipinfo.io/{ip}/geo
+     Назначение: Глубокая геолокация IP, определение хостинга/VPN продавца.
+
+036. REST Countries v3.1 [NO_KEY]
+     URL: https://restcountries.com/v3.1/name/{country}
+     Назначение: Справочные данные о странах (валюты, языки, флаги, телефонные коды).
+
+037. Zippopotam.us Postal Codes [NO_KEY]
+     URL: https://api.zippopotam.us/{country}/{postal-code}
+     Назначение: Поиск городов по почтовому индексу (поддержка US, RU и др.).
+
+038. Geoapify Geocoding API [FREE_KEY]
+     URL: https://api.geoapify.com/v1/geocode/search
+     Назначение: Бесплатный геокодер с автодополнением названий улиц.
+
+039. BigDataCloud Reverse Geocoding [FREE_KEY]
+     URL: https://api.bigdatacloud.net/data/reverse-geocode-client
+     Назначение: Быстрое клиентское определение местоположения без авторизации.
+
+================================================================================
+5. ИСКУССТВЕННЫЙ ИНТЕЛЛЕКТ, VISION И OCR (AI CORE)
+================================================================================
+
+040. Ollama Local API [NO_KEY]
+     URL: http://localhost:11434/api/generate
+     Назначение: Локальный запуск vision-моделей (llama3.2-vision, llava) без лимитов.
+
+041. Ollama Chat Endpoint [NO_KEY]
+     URL: http://localhost:11434/api/chat
+     Назначение: Диалог с мультимодальной нейросетью с сохранением контекста фото.
+
+042. Hugging Face Inference API [FREE_KEY]
+     URL: https://api-inference.huggingface.co/models/{model_id}
+     Назначение: Бесплатный запуск open-source моделей классификации изображений.
+
+043. OCR.Space Free OCR API [FREE_KEY]
+     URL: https://api.ocr.space/parse/image
+     Назначение: Распознавание текста с фото (VIN-коды под стеклом, текст на чеках).
+
+044. Groq Cloud AI API [FREE_KEY]
+     URL: https://api.groq.com/openai/v1/chat/completions
+     Назначение: Сверхбыстрый LLM-анализ описаний объявлений (Llama-3-70B, Mixtral).
+
+045. DeepAI Image Recognition [FREE_KEY]
+     URL: https://api.deepai.org/api/image-similarity
+     Назначение: Поиск дубликатов фотографий для вычисления фейковых объявлений.
+
+046. Cloudmersive Computer Vision [FREE_KEY]
+     URL: https://api.cloudmersive.com/image/recognize/describe
+     Назначение: Автоматическое описание повреждений на фото автомобиля.
+
+047. Clarifai Public Vision API [FREE_KEY]
+     URL: https://api.clarifai.com/v2/models/{model_id}/outputs
+     Назначение: Детекция объектов на фото (машины, вмятины, сколы).
+
+048. Together AI Engine [FREE_KEY]
+     URL: https://api.together.xyz/v1/chat/completions
+     Назначение: Доступ к открытым моделям компьютерного зрения.
+
+================================================================================
+6. OSINT, БЕЗОПАСНОСТЬ И АНТИФРОД ПРОДАВЦОВ (ANTI-FRAUD)
+================================================================================
+
+049. HaveIBeenPwned Account Breaches [FREE_KEY]
+     URL: https://haveibeenpwned.com/api/v3/breachedaccount/{account}
+     Назначение: Проверка утечек email продавца в базах сливов.
+
+050. EmailRep.io Reputation Engine [FREE_KEY]
+     URL: https://emailrep.io/{email}
+     Назначение: Оценка доверия к email продавца (возраст домена, спам-активность).
+
+051. Abstract Phone Verification [FREE_KEY]
+     URL: https://phonevalidation.abstractapi.com/v1/
+     Назначение: Валидация телефонного номера (оператор, страна, тип: мобильный/VoIP).
+
+052. Numverify Phone Lookup [FREE_KEY]
+     URL: http://apilayer.net/api/validate
+     Назначение: Проверка валидности номеров телефонов в РФ (+7) и США (+1).
+
+053. Discard.email Domain Checker [NO_KEY]
+     URL: https://ev.hetras.net/api/v1/is-temporary-mail/{domain}
+     Назначение: Детекция временных/одноразовых почт у подозрительных продавцов.
+
+054. VirusTotal Public API [FREE_KEY]
+     URL: https://www.virustotal.com/api/v3/urls
+     Назначение: Проверка ссылок от продавцов на фишинг и вредоносные скрипты.
+
+055. URLScan.io Web Sandbox [FREE_KEY]
+     URL: https://urlscan.io/api/v1/scan/
+     Назначение: Безопасный снимок и анализ подозрительных доменов магазинов.
+
+056. Shodan Host Investigation [FREE_KEY]
+     URL: https://api.shodan.io/shodan/host/{ip}
+     Назначение: Поиск открытых портов и уязвимостей на серверах магазинов.
+
+057. IPQualityScore Fraud Detection [FREE_KEY]
+     URL: https://ipqualityscore.com/api/json/ip/{key}/{ip}
+     Назначение: Вычисление фрод-скора (вероятность спама/мошенничества) от 0 до 100.
+
+058. StopForumSpam Lookup [NO_KEY]
+     URL: https://api.stopforumspam.org/api?ip={ip}&email={email}&json
+     Назначение: Проверка контактов продавца по глобальной базе спамеров.
+
+================================================================================
+7. ВЕБ-ПОИСК, OSINT-РАЗВЕДКА И КРАУЛИНГ (SEARCH ENGINES)
+================================================================================
+
+059. DuckDuckGo HTML Search [NO_KEY]
+     URL: https://html.duckduckgo.com/html/
+     Назначение: Анонимный сбор результатов поиска без блокировок и ключей.
+
+060. DuckDuckGo Instant Answer API [NO_KEY]
+     URL: https://api.duckduckgo.com/
+     Назначение: Мгновенные карточки товаров и фактов в JSON формате (?q={query}&format=json).
+
+061. Serper.dev Google Search [FREE_KEY]
+     URL: https://google.serper.dev/search
+     Назначение: Быстрый сбор органической выдачи Google по отзывам о продавце.
+
+062. SerpApi Google / Yandex [FREE_KEY]
+     URL: https://serpapi.com/search.json
+     Назначение: Парсинг выдачи Яндекса, Google и YouTube с обходом капчи.
+
+063. Jina Reader AI Web Scraper [NO_KEY]
+     URL: https://r.jina.ai/{url}
+     Назначение: Превращение любого URL товара в чистый Markdown текст для ИИ.
+
+064. Wayback Machine Archive API [NO_KEY]
+     URL: https://archive.org/wayback/available?url={url}
+     Назначение: Просмотр истории изменения карточки товара и старых цен.
+
+065. ScrapingAnt Proxy Engine [FREE_KEY]
+     URL: https://api.scrapingant.com/v2/general
+     Назначение: Рендеринг JS-страниц и обход Cloudflare при скрапинге.
+
+066. ScraperAPI Web Gateway [FREE_KEY]
+     URL: http://api.scraperapi.com/
+     Назначение: Автоматическая ротация резидентных прокси для б/у площадок.
+
+================================================================================
+8. ЛОКАЛИЗАЦИЯ И ПЕРЕВОД (RU / EN LOCALIZATION)
+================================================================================
+
+067. LibreTranslate Engine [FREE_KEY / NO_KEY]
+     URL: https://libretranslate.com/translate
+     Назначение: Открытый перевод описаний товаров между RU и EN.
+
+068. MyMemory Translation API [NO_KEY]
+     URL: https://api.mymemory.translated.net/get
+     Назначение: Бесплатный перевод строк интерфейса (до 1000 слов/день без ключа).
+     Параметры: ?q={text}&langpair=ru|en
+
+069. Lingva Translate (Google Mirror) [NO_KEY]
+     URL: https://lingva.ml/api/v1/{source}/{target}/{query}
+     Назначение: Быстрый перевод карточек товаров без трекеров и ограничений.
+
+070. DeepL Free API [FREE_KEY]
+     URL: https://api-free.deepl.com/v2/translate
+     Назначение: Высокоточный нейросетевой перевод для англоязычного рынка.
+
+071. FunTranslations API [FREE_KEY]
+     URL: https://api.funtranslations.com/translate/
+     Назначение: Вспомогательный эндпоинт для трансформации текста.
+
+================================================================================
+9. БАЗЫ ШТРИХКОДОВ И СПРАВОЧНИКИ ТОВАРОВ (BARCODES & UPC)
+================================================================================
+
+072. UPCitemdb Product Lookup [FREE_KEY]
+     URL: https://api.upcitemdb.com/prod/trial/lookup?upc={barcode}
+     Назначение: Поиск названия, характеристик и картинок товара по штрихкоду.
+
+073. Open Food Facts API [NO_KEY]
+     URL: https://world.openfoodfacts.org/api/v2/product/{barcode}.json
+     Назначение: Глобальная открытая база продуктов питания и составов.
+
+074. Open Beauty Facts API [NO_KEY]
+     URL: https://world.openbeautyfacts.org/api/v2/product/{barcode}.json
+     Назначение: База косметики и парфюмерии (для парсинга WB и Ozon).
+
+075. Open Products Facts [NO_KEY]
+     URL: https://world.openproductsfacts.org/api/v0/product/{barcode}.json
+     Назначение: Универсальный справочник любых потребительских товаров.
+
+076. Barcode Spider API [FREE_KEY]
+     URL: https://api.barcodespider.com/v1/lookup
+     Назначение: Поиск брендов электроники по EAN/UPC кодам.
+
+077. EAN Search Engine [FREE_KEY]
+     URL: https://api.ean-search.org/api
+     Назначение: Валидация подлинности штрихкодов европейских и американских товаров.
+
+================================================================================
+10. PUSH-УВЕДОМЛЕНИЯ, МЕССЕНДЖЕРЫ И ВЕБХУКИ (NOTIFICATIONS)
+================================================================================
+
+078. Firebase Cloud Messaging (FCM) [FREE_KEY]
+     URL: https://fcm.googleapis.com/v1/projects/{project_id}/messages:send
+     Назначение: Мгновенная доставка PUSH-уведомлений на Android APK.
+
+079. OneSignal REST API [FREE_KEY]
+     URL: https://onesignal.com/api/v1/notifications
+     Назначение: Альтернативный PUSH-шлюз для мобильных и веб-уведомлений.
+
+080. Telegram Bot API [FREE_KEY]
+     URL: https://api.telegram.org/bot{token}/sendMessage
+     Назначение: Дублирование найденных скидок и компромата в Telegram-канал/чат.
+
+081. Telegram Webhook Updates [FREE_KEY]
+     URL: https://api.telegram.org/bot{token}/setWebhook
+     Назначение: Прием команд от пользователей через Telegram-бота.
+
+082. Discord Webhooks [NO_KEY]
+     URL: https://discord.com/api/webhooks/{webhook.id}/{webhook.token}
+     Назначение: Отправка карточек с найденными автомобилями в Discord сервер.
+
+083. Pushover API [FREE_KEY]
+     URL: https://api.pushover.net/1/messages.json
+     Назначение: Экстренные уведомления о падении цен для PRO-пользователей.
+
+084. Pushbullet API [FREE_KEY]
+     URL: https://api.pushbullet.com/v2/pushes
+     Назначение: Синхронизация уведомлений между ПК и мобильным клиентом.
+
+085. ntfy.sh Open Push Service [NO_KEY]
+     URL: https://ntfy.sh/{topic}
+     Назначение: Отправка HTTP POST push-уведомлений без авторизации и регистрации.
+
+================================================================================
+11. ПОГОДА И РЕГИОНАЛЬНЫЕ ДАННЫЕ (ENVIRONMENT CONTEXT)
+================================================================================
+
+086. Open-Meteo Weather Forecast [NO_KEY]
+     URL: https://api.open-meteo.com/v1/forecast
+     Назначение: Погода в городе поиска (для автоподбора: оценка условий осмотра).
+     Параметры: ?latitude={lat}&longitude={lon}&current_weather=true
+
+087. WeatherAPI.com [FREE_KEY]
+     URL: https://api.weatherapi.com/v1/current.json
+     Назначение: Точный прогноз погоды и архив для анализа фото авто (дождь/снег).
+
+088. OpenWeatherMap Free API [FREE_KEY]
+     URL: https://api.openweathermap.org/data/2.5/weather
+     Назначение: Текущие погодные условия по названию города.
+
+089. Sunrise and Sunset API [NO_KEY]
+     URL: https://api.sunrisesunset.io/json
+     Назначение: Определение светового дня (помогает ИИ оценить освещение на фото).
+
+090. AirVisual Air Quality API [FREE_KEY]
+     URL: https://api.airvisual.com/v2/city
+     Назначение: Анализ чистоты воздуха в регионе продавца.
+
+================================================================================
+12. СТАТИЧЕСКИЙ BACKEND, GITOPS И ХРАНИЛИЩА (INFRASTRUCTURE)
+================================================================================
+
+091. GitHub REST API [FREE_KEY / NO_KEY]
+     URL: https://api.github.com/repos/{owner}/{repo}/contents/{path}
+     Назначение: Чтение и запись спарсенных JSON-файлов прямо в репозиторий.
+
+092. GitHub Releases API [NO_KEY]
+     URL: https://api.github.com/repos/{owner}/{repo}/releases/latest
+     Назначение: Автоматическая проверка обновлений собранного APK файла.
+
+093. Supabase REST API [FREE_KEY]
+     URL: https://{project_ref}.supabase.co/rest/v1/{table}
+     Назначение: Облачная PostgreSQL база данных для синхронизации PRO-пользователей.
+
+094. JSONBin.io Cloud JSON Store [FREE_KEY]
+     URL: https://api.jsonbin.io/v3/b
+     Назначение: Временное облачное хранилище для черных списков (Blacklist).
+
+095. Mocki.io API Generator [NO_KEY]
+     URL: https://mocki.io/fake-json-api
+     Назначение: Генерация статических API-точек для тестирования мобильного клиента.
+
+096. CountAPI (Hit Counter) [NO_KEY]
+     URL: https://api.countapi.xyz/hit/{namespace}/{key}
+     Назначение: Бесплатный учет просмотров объявлений и переходов по реферальным ссылкам.
+
+097. IPFS Public Gateway (Cloudflare) [NO_KEY]
+     URL: https://cloudflare-ipfs.com/ipfs/{cid}
+     Назначение: Децентрализованное хранение фото компромата и отчетов.
+
+098. Pastebin API [FREE_KEY]
+     URL: https://pastebin.com/api/api_post.php
+     Назначение: Экспорт длинных отчетов по автомобилям во внешние текстовые дампы.
+
+099. ImgBB Free Image Hosting API [FREE_KEY]
+     URL: https://api.imgbb.com/1/upload
+     Назначение: Временный хостинг аватарок пользователей и сжатых фото товаров.
+
+100. Cloudinary Image Management [FREE_KEY]
+     URL: https://api.cloudinary.com/v1_1/{cloud_name}/image/upload
+     Назначение: Оптимизация и ресайз фотографий перед отправкой в Vision AI.
+
+101. QR Code Generator API [NO_KEY]
+     URL: https://api.qrserver.com/v1/create-qr-code/
+     Назначение: Генерация QR-кодов для реферальных ссылок и быстрого шеринга товаров.
+     Параметры: ?size=150x150&data={url}
+
+================================================================================
+                      КОНЕЦ РЕГИСТРА PUBLIC APIS
+================================================================================
+
+
+// FILE: frontend/App.tsx
+import React, { useState, useEffect, useRef } from 'react';
+
+// ==========================================
+// 1. УТИЛИТЫ И БАЗОВЫЕ ФУНКЦИИ
+// ==========================================
+
+// Жесткое удаление смайликов (оставляем только текст, цифры и базовую пунктуацию)
+const stripEmojis = (text: string) => {
+  return text.replace(/[^\w\s.,!?"'а-яА-ЯёЁa-zA-Z0-9-()]/g, '');
+};
+
+const generateUserId = () => {
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+  let id = 'ID-';
+  for (let i = 0; i < 6; i++) id += chars.charAt(Math.floor(Math.random() * chars.length));
+  return id;
+};
+
+// ==========================================
+// 2. SVG ИКОНКИ (БЕЗ ВНЕШНИХ ЗАВИСИМОСТЕЙ)
+// ==========================================
+const Icons = {
+  Home: () => <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="w-6 h-6"><path strokeLinecap="round" strokeLinejoin="round" d="M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6" /></svg>,
+  Chat: () => <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="w-6 h-6"><path strokeLinecap="round" strokeLinejoin="round" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" /></svg>,
+  User: () => <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="w-6 h-6"><path strokeLinecap="round" strokeLinejoin="round" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z" /></svg>,
+  Search: () => <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="w-5 h-5"><path strokeLinecap="round" strokeLinejoin="round" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" /></svg>,
+  Shield: () => <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="w-5 h-5"><path strokeLinecap="round" strokeLinejoin="round" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" /></svg>,
+  Warning: () => <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="w-5 h-5"><path strokeLinecap="round" strokeLinejoin="round" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" /></svg>
+};
+
+// ==========================================
+// 3. ТИПЫ ДАННЫХ И МОКИ
+// ==========================================
+type Page = 'feed' | 'chat' | 'profile';
+type ChatTab = 'global' | 'friends' | 'ai';
+
+interface UserProfile {
+  id: string;
+  name: string;
+  photoUrl: string | null;
+}
+
+interface Message {
+  id: number;
+  sender: string;
+  text: string;
+  timestamp: string;
+  isMine: boolean;
+}
+
+const MOCK_LISTINGS = [
+  {
+    id: 1,
+    title: "Toyota Camry 2.5 AT, 2021",
+    price: 3200000,
+    platform: "Avito",
+    city: "Ульяновск",
+    sellerName: "Иван Иванов",
+    sellerPhone: "+7 (999) 123-45-67",
+    isPerekup: true,
+    hasAccidents: true,
+    owners: 4,
+    image: "https://images.unsplash.com/photo-1621007947382-bb3c3994e3fd?auto=format&fit=crop&w=400&q=80"
+  },
+  {
+    id: 2,
+    title: "Apple MacBook Pro 16 M2 Max",
+    price: 280000,
+    platform: "Avito",
+    city: "Ульяновск",
+    sellerName: "TechStore",
+    sellerPhone: "+7 (800) 555-35-35",
+    isPerekup: false,
+    hasAccidents: false,
+    owners: 1,
+    image: "https://images.unsplash.com/photo-1517336714731-489689fd1ca8?auto=format&fit=crop&w=400&q=80"
+  },
+  {
+    id: 3,
+    title: "Видеокарта RTX 4090",
+    price: 195000,
+    platform: "DNS",
+    city: "Москва",
+    sellerName: "DNS Магазин",
+    sellerPhone: "8 (800) 770-79-99",
+    isPerekup: false,
+    hasAccidents: false,
+    owners: 0,
+    image: "https://images.unsplash.com/photo-1591488320449-011701bb6704?auto=format&fit=crop&w=400&q=80"
+  }
+];
+
+// ==========================================
+// 4. КОМПОНЕНТ ЛЕНТЫ И ФИЛЬТРОВ (FEED)
+// ==========================================
+const FeedPage: React.FC = () => {
+  const [search, setSearch] = useState("");
+  const [city, setCity] = useState("Ульяновск");
+  const [minPrice, setMinPrice] = useState("");
+  const [maxPrice, setMaxPrice] = useState("");
+
+  return (
+    <div className="pb-24 pt-4 px-4 max-w-3xl mx-auto animate-fade-in">
+      <h1 className="text-3xl font-extrabold text-gray-900 mb-6 tracking-tight">Поиск товаров</h1>
+      
+      {/* Панель жестких фильтров */}
+      <div className="bg-white p-5 rounded-2xl shadow-[0_8px_30px_rgb(0,0,0,0.04)] border border-gray-100 mb-8">
+        <div className="relative mb-4">
+          <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none text-gray-400">
+            <Icons.Search />
+          </div>
+          <input 
+            type="text" 
+            placeholder="Что ищем? (Например: MacBook или BMW)"
+            className="w-full pl-10 pr-4 py-3 bg-gray-50 border border-gray-200 rounded-xl focus:ring-2 focus:ring-blue-500 focus:border-blue-500 transition-all font-medium"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+          />
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-4">
+          <div>
+            <label className="block text-xs font-bold text-gray-500 uppercase tracking-wider mb-1">Город</label>
+            <input type="text" value={city} onChange={(e) => setCity(e.target.value)}
+              className="w-full p-2.5 bg-gray-50 border border-gray-200 rounded-lg focus:ring-2 focus:ring-blue-500 font-medium" />
+          </div>
+          <div>
+            <label className="block text-xs font-bold text-gray-500 uppercase tracking-wider mb-1">Бюджет от (₽)</label>
+            <input type="number" value={minPrice} onChange={(e) => setMinPrice(e.target.value)} placeholder="0"
+              className="w-full p-2.5 bg-gray-50 border border-gray-200 rounded-lg focus:ring-2 focus:ring-blue-500 font-medium" />
+          </div>
+          <div>
+            <label className="block text-xs font-bold text-gray-500 uppercase tracking-wider mb-1">Бюджет до (₽)</label>
+            <input type="number" value={maxPrice} onChange={(e) => setMaxPrice(e.target.value)} placeholder="Бесконечность"
+              className="w-full p-2.5 bg-gray-50 border border-gray-200 rounded-lg focus:ring-2 focus:ring-blue-500 font-medium" />
+          </div>
+        </div>
+
+        <button className="w-full bg-gray-900 hover:bg-black text-white font-bold py-3.5 rounded-xl transition-colors shadow-md">
+          Применить фильтры
+        </button>
+      </div>
+
+      {/* Выдача результатов */}
+      <div className="space-y-5">
+        {MOCK_LISTINGS.map((item) => (
+          <div key={item.id} className="bg-white rounded-2xl overflow-hidden shadow-[0_4px_20px_rgb(0,0,0,0.05)] border border-gray-100 flex flex-col md:flex-row">
+            <div className="md:w-2/5 h-48 md:h-auto relative">
+              <img src={item.image} alt={item.title} className="w-full h-full object-cover" />
+              <div className="absolute top-3 left-3 bg-white/90 backdrop-blur-sm px-2.5 py-1 rounded-md text-xs font-bold text-gray-800 shadow-sm">
+                {item.platform}
+              </div>
+            </div>
+            
+            <div className="p-5 flex-1 flex flex-col justify-between">
+              <div>
+                <div className="flex justify-between items-start">
+                  <h3 className="text-xl font-bold text-gray-900 leading-tight mb-1">{item.title}</h3>
+                </div>
+                <p className="text-2xl font-extrabold text-blue-600 mb-3">{item.price.toLocaleString()} ₽</p>
+                
+                {/* Компромат и плашки */}
+                <div className="flex flex-wrap gap-2 mb-4">
+                  {item.isPerekup ? (
+                    <span className="inline-flex items-center gap-1 bg-red-50 text-red-700 px-2.5 py-1 rounded-md text-xs font-bold border border-red-100">
+                      <Icons.Warning /> Перекуп
+                    </span>
+                  ) : (
+                    <span className="inline-flex items-center gap-1 bg-green-50 text-green-700 px-2.5 py-1 rounded-md text-xs font-bold border border-green-100">
+                      <Icons.Shield /> Проверенный продавец
+                    </span>
+                  )}
+                  {item.hasAccidents && (
+                    <span className="inline-flex items-center gap-1 bg-orange-50 text-orange-700 px-2.5 py-1 rounded-md text-xs font-bold border border-orange-100">
+                      Битая (ДТП)
+                    </span>
+                  )}
+                  <span className="bg-gray-100 text-gray-600 px-2.5 py-1 rounded-md text-xs font-bold">
+                    Владельцев: {item.owners}
+                  </span>
+                </div>
+              </div>
+
+              {/* Сбор данных о продавце */}
+              <div className="bg-gray-50 rounded-xl p-3 border border-gray-100">
+                <p className="text-sm text-gray-500 mb-1">Продавец: <span className="font-bold text-gray-900">{item.sellerName}</span></p>
+                <p className="text-sm text-gray-500">Контакт: <span className="font-mono bg-white px-2 py-0.5 rounded border border-gray-200 font-bold text-gray-800 tracking-wide">{item.sellerPhone}</span></p>
+              </div>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+};
+
+// ==========================================
+// 5. КОМПОНЕНТ МЕССЕНДЖЕРА (БЕЗ СМАЙЛОВ)
+// ==========================================
+const MessengerPage: React.FC<{ user: UserProfile }> = ({ user }) => {
+  const [activeTab, setActiveTab] = useState<ChatTab>('global');
+  const [inputText, setInputText] = useState("");
+  const [friendId, setFriendId] = useState("");
+  
+  // Раздельные истории для имитации
+  const [globalChat, setGlobalChat] = useState<Message[]>([
+    { id: 1, sender: "Система", text: "Добро пожаловать в мировой чат. Смайлики запрещены правилами сервера.", timestamp: "12:00", isMine: false }
+  ]);
+  const [friendsChat, setFriendsChat] = useState<Message[]>([]);
+  const [aiChat, setAiChat] = useState<Message[]>([
+    { id: 1, sender: "Vision AI", text: "Привет. Я ИИ-ассистент. Отправь мне ссылку на фото или спроси о проверке автомобиля.", timestamp: "12:00", isMine: false }
+  ]);
+
+  const messagesEndRef = useRef<HTMLDivElement>(null);
+
+  // Автоскролл вниз
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [globalChat, friendsChat, aiChat, activeTab]);
+
+  const handleInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    // ВАЖНО: Фильтруем смайлики прямо во время печати
+    setInputText(stripEmojis(e.target.value));
+  };
+
+  const sendMessage = () => {
+    const text = inputText.trim();
+    if (!text) return;
+
+    const newMessage: Message = {
+      id: Date.now(),
+      sender: user.name || "Аноним",
+      text: text,
+      timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+      isMine: true
+    };
+
+    if (activeTab === 'global') {
+      setGlobalChat(prev => [...prev, newMessage]);
+    } else if (activeTab === 'friends') {
+      if (!friendId.trim()) return alert("Сначала введите ID друга сверху!");
+      setFriendsChat(prev => [...prev, newMessage]);
+    } else if (activeTab === 'ai') {
+      setAiChat(prev => [...prev, newMessage]);
+      
+      // Имитация ответа ИИ
+      setTimeout(() => {
+        setAiChat(prev => [...prev, {
+          id: Date.now() + 1,
+          sender: "Vision AI",
+          text: `Анализирую ваш запрос: "${text}". Запускаю протокол сбора компромата...`,
+          timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+          isMine: false
+        }]);
+      }, 1000);
+    }
+
+    setInputText("");
+  };
+
+  const handleKeyPress = (e: React.KeyboardEvent) => {
+    if (e.key === 'Enter') sendMessage();
+  };
+
+  const currentMessages = activeTab === 'global' ? globalChat : activeTab === 'friends' ? friendsChat : aiChat;
+
+  return (
+    <div className="h-screen flex flex-col bg-gray-50 pb-16">
+      {/* Шапка чата */}
+      <div className="bg-white border-b border-gray-200 px-4 py-4 pt-6 shadow-sm z-10">
+        <h1 className="text-2xl font-extrabold text-gray-900 mb-4">Мессенджеры</h1>
+        <div className="flex bg-gray-100 p-1 rounded-xl">
+          <button 
+            onClick={() => setActiveTab('global')}
+            className={`flex-1 py-2 text-sm font-bold rounded-lg transition-all ${activeTab === 'global' ? 'bg-white text-blue-600 shadow-sm' : 'text-gray-500 hover:text-gray-900'}`}
+          >
+            Всемирный
+          </button>
+          <button 
+            onClick={() => setActiveTab('friends')}
+            className={`flex-1 py-2 text-sm font-bold rounded-lg transition-all ${activeTab === 'friends' ? 'bg-white text-blue-600 shadow-sm' : 'text-gray-500 hover:text-gray-900'}`}
+          >
+            С друзьями
+          </button>
+          <button 
+            onClick={() => setActiveTab('ai')}
+            className={`flex-1 py-2 text-sm font-bold rounded-lg transition-all ${activeTab === 'ai' ? 'bg-white text-blue-600 shadow-sm' : 'text-gray-500 hover:text-gray-900'}`}
+          >
+            Чат с AI
+          </button>
+        </div>
+      </div>
+
+      {/* Поле ID для друзей */}
+      {activeTab === 'friends' && (
+        <div className="bg-white border-b border-gray-200 px-4 py-3 flex gap-2 items-center">
+          <span className="text-sm font-bold text-gray-500">Кому:</span>
+          <input 
+            type="text" 
+            placeholder="Введите ID (Например: ID-X7B9A)"
+            value={friendId}
+            onChange={(e) => setFriendId(e.target.value.toUpperCase())}
+            className="flex-1 bg-gray-50 border border-gray-200 rounded-lg px-3 py-1.5 text-sm font-mono focus:outline-none focus:border-blue-500"
+          />
+        </div>
+      )}
+
+      {/* Область сообщений */}
+      <div className="flex-1 overflow-y-auto p-4 space-y-4">
+        {currentMessages.length === 0 ? (
+          <div className="h-full flex items-center justify-center">
+            <p className="text-gray-400 font-medium text-center">
+              Здесь пока нет сообщений.<br/>Смайлики автоматически удаляются.
+            </p>
+          </div>
+        ) : (
+          currentMessages.map((msg) => (
+            <div key={msg.id} className={`flex flex-col ${msg.isMine ? 'items-end' : 'items-start'}`}>
+              <span className="text-[10px] font-bold text-gray-400 mb-1 ml-1">
+                {msg.sender} • {msg.timestamp}
+              </span>
+              <div className={`max-w-[80%] px-4 py-2.5 rounded-2xl ${
+                msg.isMine 
+                  ? 'bg-blue-600 text-white rounded-tr-sm' 
+                  : msg.sender === 'Vision AI' 
+                    ? 'bg-gray-900 text-white rounded-tl-sm'
+                    : 'bg-white border border-gray-200 text-gray-800 rounded-tl-sm shadow-sm'
+              }`}>
+                <p className="text-[15px] leading-relaxed break-words">{msg.text}</p>
+              </div>
+            </div>
+          ))
+        )}
+        <div ref={messagesEndRef} />
+      </div>
+
+      {/* Инпут */}
+      <div className="bg-white border-t border-gray-200 p-4 pb-6">
+        <div className="flex gap-2 max-w-3xl mx-auto">
+          <input 
+            type="text"
+            value={inputText}
+            onChange={handleInputChange}
+            onKeyPress={handleKeyPress}
+            placeholder="Сообщение (без смайликов)..."
+            className="flex-1 bg-gray-50 border border-gray-200 rounded-xl px-4 py-3 focus:outline-none focus:ring-2 focus:ring-blue-500 transition-all font-medium"
+          />
+          <button 
+            onClick={sendMessage}
+            disabled={!inputText.trim()}
+            className="bg-blue-600 disabled:bg-blue-300 hover:bg-blue-700 text-white rounded-xl px-6 font-bold transition-colors shadow-sm"
+          >
+            Отправить
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// ==========================================
+// 6. КОМПОНЕНТ ПРОФИЛЯ
+// ==========================================
+const ProfilePage: React.FC<{ user: UserProfile, updateUser: (u: Partial<UserProfile>) => void }> = ({ user, updateUser }) => {
+  const handleNameChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    // Убираем смайлы из имени
+    updateUser({ name: stripEmojis(e.target.value) });
+  };
+
+  const handlePhotoUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    // Имитация загрузки фото через создание локального URL
+    if (e.target.files && e.target.files[0]) {
+      const url = URL.createObjectURL(e.target.files[0]);
+      updateUser({ photoUrl: url });
+    }
+  };
+
+  return (
+    <div className="p-4 pt-8 max-w-lg mx-auto animate-fade-in">
+      <h1 className="text-3xl font-extrabold text-gray-900 mb-8 text-center">Профиль</h1>
+
+      <div className="bg-white rounded-3xl p-8 shadow-[0_8px_30px_rgb(0,0,0,0.04)] border border-gray-100 flex flex-col items-center">
+        
+        {/* Аватарка */}
+        <div className="relative mb-6">
+          <div className="w-32 h-32 rounded-full border-4 border-gray-50 bg-gray-100 overflow-hidden shadow-inner flex items-center justify-center">
+            {user.photoUrl ? (
+              <img src={user.photoUrl} alt="Avatar" className="w-full h-full object-cover" />
+            ) : (
+              <Icons.User />
+            )}
+          </div>
+          <label className="absolute bottom-0 right-0 bg-blue-600 hover:bg-blue-700 text-white p-2.5 rounded-full cursor-pointer shadow-lg transition-transform hover:scale-105">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="w-5 h-5"><path strokeLinecap="round" strokeLinejoin="round" d="M12 4v16m8-8H4"/></svg>
+            <input type="file" accept="image/*" className="hidden" onChange={handlePhotoUpload} />
+          </label>
+        </div>
+
+        {/* Форма данных */}
+        <div className="w-full space-y-5">
+          <div>
+            <label className="block text-xs font-bold text-gray-500 uppercase tracking-wider mb-1.5 ml-1">
+              Ваш персональный ID
+            </label>
+            <div className="w-full bg-gray-50 border border-gray-200 text-gray-900 rounded-xl px-4 py-3 font-mono font-bold text-center text-lg tracking-widest cursor-copy" title="Нажмите, чтобы скопировать">
+              {user.id}
+            </div>
+            <p className="text-xs text-center text-gray-400 mt-2 font-medium">Дайте этот ID друзьям, чтобы общаться в чате</p>
+          </div>
+
+          <div>
+            <label className="block text-xs font-bold text-gray-500 uppercase tracking-wider mb-1.5 ml-1">
+              Отображаемое Имя
+            </label>
+            <input 
+              type="text" 
+              value={user.name} 
+              onChange={handleNameChange}
+              placeholder="Введите имя (без смайлов)"
+              className="w-full bg-white border border-gray-300 rounded-xl px-4 py-3 font-bold text-gray-900 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500 transition-all text-center"
+            />
+          </div>
+        </div>
+
+      </div>
+    </div>
+  );
+};
+
+// ==========================================
+// 7. ГЛАВНЫЙ ОРКЕСТРАТОР (КОНТЕЙНЕР ПРИЛОЖЕНИЯ)
+// ==========================================
+export default function App() {
+  const [currentPage, setCurrentPage] = useState<Page>('feed');
+  const [user, setUser] = useState<UserProfile>(() => {
+    // Восстановление профиля из LocalStorage
+    const saved = localStorage.getItem('mv_user_profile');
+    if (saved) return JSON.parse(saved);
+    return { id: generateUserId(), name: '', photoUrl: null };
+  });
+
+  useEffect(() => {
+    localStorage.setItem('mv_user_profile', JSON.stringify(user));
+  }, [user]);
+
+  const updateUser = (updates: Partial<UserProfile>) => {
+    setUser(prev => ({ ...prev, ...updates }));
+  };
+
+  return (
+    <div className="min-h-screen bg-gray-50 font-sans text-gray-900 selection:bg-blue-200">
+      
+      {/* Динамический рендеринг активной страницы */}
+      <main className="w-full h-full">
+        {currentPage === 'feed' && <FeedPage />}
+        {currentPage === 'chat' && <MessengerPage user={user} />}
+        {currentPage === 'profile' && <ProfilePage user={user} updateUser={updateUser} />}
+      </main>
+
+      {/* Нижняя навигационная панель (Bottom Navigation Bar) */}
+      <nav className="fixed bottom-0 w-full bg-white/90 backdrop-blur-md border-t border-gray-200 pb-safe z-50">
+        <div className="flex justify-around items-center h-16 max-w-md mx-auto px-2">
+          
+          <button 
+            onClick={() => setCurrentPage('feed')}
+            className={`flex flex-col items-center justify-center w-full h-full space-y-1 transition-colors ${currentPage === 'feed' ? 'text-blue-600' : 'text-gray-400 hover:text-gray-600'}`}
+          >
+            <Icons.Home />
+            <span className="text-[10px] font-bold tracking-wide">ПОИСК</span>
+          </button>
+
+          <button 
+            onClick={() => setCurrentPage('chat')}
+            className={`flex flex-col items-center justify-center w-full h-full space-y-1 transition-colors ${currentPage === 'chat' ? 'text-blue-600' : 'text-gray-400 hover:text-gray-600'}`}
+          >
+            <div className="relative">
+              <Icons.Chat />
+              <span className="absolute -top-1 -right-1 bg-red-500 w-2.5 h-2.5 rounded-full border-2 border-white"></span>
+            </div>
+            <span className="text-[10px] font-bold tracking-wide">ЧАТЫ</span>
+          </button>
+
+          <button 
+            onClick={() => setCurrentPage('profile')}
+            className={`flex flex-col items-center justify-center w-full h-full space-y-1 transition-colors ${currentPage === 'profile' ? 'text-blue-600' : 'text-gray-400 hover:text-gray-600'}`}
+          >
+            <Icons.User />
+            <span className="text-[10px] font-bold tracking-wide">ПРОФИЛЬ</span>
+          </button>
+
+        </div>
+      </nav>
+    </div>
+  );
+}
+
+
+// FILE: frontend/index.html
+<!DOCTYPE html>
+<html lang="ru" class="dark">
+<head>
+    <meta charset="UTF-8">
+    <!-- Оптимизация под мобильные устройства и Webview (Sketchware) -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <meta name="theme-color" content="#0f172a">
+    <title>OmniScan | Ultimate OSINT Engine</title>
+    
+    <!-- Подключаем Tailwind (через CDN для удобства в одном файле) -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            darkMode: 'class',
+            theme: {
+                extend: {
+                    colors: {
+                        omni: {
+                            bg: '#0B0F19',
+                            panel: '#151C2C',
+                            border: '#2A3441',
+                            accent: '#3B82F6',
+                            danger: '#EF4444',
+                            warning: '#F59E0B',
+                            success: '#10B981'
+                        }
+                    },
+                    animation: {
+                        'pulse-slow': 'pulse 3s cubic-bezier(0.4, 0, 0.6, 1) infinite',
+                        'scan-line': 'scan 2s linear infinite',
+                    },
+                    keyframes: {
+                        scan: {
+                            '0%': { transform: 'translateY(-100%)' },
+                            '100%': { transform: 'translateY(1000%)' }
+                        }
+                    }
+                }
+            }
+        }
+    </script>
+
+    <style>
+        /* ==========================================
+           1. КАСТОМНЫЕ СТИЛИ И АНИМАЦИИ
+           ========================================== */
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;700&display=swap');
+        
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #0B0F19;
+            color: #E2E8F0;
+            overflow-x: hidden;
+            -webkit-tap-highlight-color: transparent;
+        }
+
+        .font-mono { font-family: 'JetBrains Mono', monospace; }
+
+        /* Стилизация скроллбара под хакерский интерфейс */
+        ::-webkit-scrollbar { width: 6px; height: 6px; }
+        ::-webkit-scrollbar-track { background: #0B0F19; }
+        ::-webkit-scrollbar-thumb { background: #3B82F6; border-radius: 3px; }
+        ::-webkit-scrollbar-thumb:hover { background: #2563EB; }
+
+        /* Glassmorphism панели */
+        .glass-panel {
+            background: rgba(21, 28, 44, 0.7);
+            backdrop-filter: blur(12px);
+            -webkit-backdrop-filter: blur(12px);
+            border: 1px solid rgba(255, 255, 255, 0.05);
+            box-shadow: 0 4px 30px rgba(0, 0, 0, 0.5);
+        }
+
+        /* Кастомные чекбоксы-кнопки */
+        .platform-checkbox:checked + div {
+            background-color: rgba(59, 130, 246, 0.2);
+            border-color: #3B82F6;
+            color: #fff;
+        }
+
+        .strict-toggle:checked + div {
+            background-color: rgba(239, 68, 68, 0.2);
+            border-color: #EF4444;
+            color: #fff;
+        }
+
+        /* Глитч-эффект для PRO статуса */
+        .glitch-text {
+            position: relative;
+            display: inline-block;
+        }
+        .pro-badge {
+            background: linear-gradient(90deg, #F59E0B, #FCD34D);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            font-weight: 900;
+            text-shadow: 0 0 10px rgba(245, 158, 11, 0.3);
+        }
+    </style>
+</head>
+<body class="flex flex-col h-screen md:flex-row pb-20 md:pb-0">
+
+    <!-- ==========================================
+         2. БОКОВАЯ/НИЖНЯЯ ПАНЕЛЬ НАВИГАЦИИ (Адаптив)
+         ========================================== -->
+    <nav class="glass-panel fixed bottom-0 w-full md:relative md:w-20 lg:w-64 md:h-screen z-50 flex md:flex-col justify-around md:justify-start items-center md:items-start p-3 md:p-4 border-t md:border-t-0 md:border-r border-omni-border transition-all">
+        
+        <!-- Логотип (только десктоп) -->
+        <div class="hidden md:flex items-center w-full mb-8 mt-2 px-2">
+            <svg class="w-8 h-8 text-blue-500 animate-pulse-slow" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 10l2 2m0 0l2-2m-2 2v4"></path></svg>
+            <span class="ml-3 font-bold text-xl tracking-widest hidden lg:block text-white">OMNI<span class="text-blue-500">SCAN</span></span>
+        </div>
+
+        <!-- Кнопки навигации -->
+        <a href="#" class="nav-item group flex flex-col md:flex-row items-center w-full p-2 md:p-3 rounded-xl bg-blue-500/10 text-blue-500 md:mb-2">
+            <svg class="w-6 h-6 md:mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"></path></svg>
+            <span class="text-[10px] md:text-sm font-medium mt-1 md:mt-0 hidden md:block lg:block">Скан Рынка</span>
+        </a>
+
+        <a href="#" class="nav-item group flex flex-col md:flex-row items-center w-full p-2 md:p-3 rounded-xl text-gray-400 hover:bg-white/5 hover:text-white transition-all md:mb-2">
+            <svg class="w-6 h-6 md:mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+            <span class="text-[10px] md:text-sm font-medium mt-1 md:mt-0 hidden md:block lg:block">История</span>
+        </a>
+
+        <a href="#" class="nav-item group flex flex-col md:flex-row items-center w-full p-2 md:p-3 rounded-xl text-gray-400 hover:bg-white/5 hover:text-white transition-all md:mb-2">
+            <svg class="w-6 h-6 md:mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 8h2a2 2 0 012 2v6a2 2 0 01-2 2h-2v4l-4-4H9a1.994 1.994 0 01-1.414-.586m0 0L11 14h4a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2v4l.586-.586z"></path></svg>
+            <span class="text-[10px] md:text-sm font-medium mt-1 md:mt-0 hidden md:block lg:block">Чаты (P2P)</span>
+        </a>
+
+        <div class="hidden md:block flex-grow"></div>
+
+        <!-- iVizion Status -->
+        <div class="hidden lg:block w-full p-4 glass-panel rounded-xl border-omni-border mb-4 text-center cursor-pointer hover:border-amber-500 transition-colors">
+            <div class="text-xs text-gray-400 mb-1">Нейросеть iVizion</div>
+            <div class="pro-badge text-lg tracking-widest uppercase">Locked</div>
+            <div class="text-[10px] text-gray-500 mt-2">Требуется PRO-ключ</div>
+        </div>
+
+        <a href="#" onclick="openSettings()" class="nav-item group flex flex-col md:flex-row items-center w-full p-2 md:p-3 rounded-xl text-gray-400 hover:bg-white/5 hover:text-white transition-all">
+            <svg class="w-6 h-6 md:mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path></svg>
+            <span class="text-[10px] md:text-sm font-medium mt-1 md:mt-0 hidden md:block lg:block">Настройки</span>
+        </a>
+    </nav>
+
+    <!-- ==========================================
+         3. ГЛАВНАЯ РАБОЧАЯ ЗОНА
+         ========================================== -->
+    <main class="flex-1 flex flex-col h-full overflow-hidden relative">
+        
+        <!-- Header (Мобильный) -->
+        <header class="md:hidden glass-panel px-4 py-3 flex justify-between items-center z-40">
+            <div class="flex items-center">
+                <svg class="w-6 h-6 text-blue-500 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"></path></svg>
+                <span class="font-bold text-lg">OmniScan</span>
+            </div>
+            <div id="connection-status" class="w-3 h-3 rounded-full bg-red-500 shadow-[0_0_8px_#EF4444]"></div>
+        </header>
+
+        <!-- Рабочая область (Скроллируемая) -->
+        <div class="flex-1 overflow-y-auto p-4 md:p-8 custom-scrollbar relative">
+            
+            <div class="max-w-5xl mx-auto space-y-6">
+                
+                <!-- Заголовок страницы -->
+                <div class="flex justify-between items-end mb-8 hidden md:flex">
+                    <div>
+                        <h2 class="text-3xl font-bold text-white mb-2">OSINT Терминал</h2>
+                        <p class="text-gray-400">Настройте жесткие фильтры для поиска цели.</p>
+                    </div>
+                    <div class="flex items-center space-x-2 text-sm text-gray-400 bg-omni-panel px-3 py-1 rounded-full border border-omni-border">
+                        <div id="desktop-conn-status" class="w-2 h-2 rounded-full bg-red-500"></div>
+                        <span id="server-status-text">Сервер оффлайн</span>
+                    </div>
+                </div>
+
+                <!-- ==========================================
+                     ФОРМА ПОИСКА (БЕЗЖАЛОСТНЫЕ ФИЛЬТРЫ)
+                     ========================================== -->
+                <form id="omni-scanner-form" class="glass-panel rounded-2xl p-5 md:p-8 shadow-2xl relative overflow-hidden">
+                    
+                    <!-- Декоративная линия сканера (анимация) -->
+                    <div class="absolute inset-0 w-full h-[2px] bg-blue-500/50 shadow-[0_0_15px_#3B82F6] animate-scan-line hidden pointer-events-none z-0" id="scan-fx"></div>
+
+                    <div class="relative z-10 space-y-8">
+                        
+                        <!-- 1. Базовый запрос -->
+                        <div>
+                            <label class="block text-xs uppercase tracking-widest text-gray-500 font-bold mb-3">Целевой запрос</label>
+                            <div class="relative">
+                                <input type="text" id="target_query" required placeholder="Например: Toyota Camry 2.5, Keenetic Giga, Квартира..." 
+                                       class="w-full bg-omni-bg border border-omni-border rounded-xl px-12 py-4 text-white text-lg focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 transition-all font-mono">
+                                <svg class="w-6 h-6 absolute left-4 top-4 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"></path></svg>
+                            </div>
+                        </div>
+
+                        <!-- 2. Выбор площадок (Custom Checkboxes) -->
+                        <div>
+                            <label class="block text-xs uppercase tracking-widest text-gray-500 font-bold mb-3">Векторы атаки (Площадки)</label>
+                            <div class="grid grid-cols-2 md:grid-cols-4 gap-3">
+                                
+                                <label class="relative cursor-pointer">
+                                    <input type="checkbox" name="platforms" value="avito" checked class="peer sr-only platform-checkbox">
+                                    <div class="p-3 bg-omni-bg border border-omni-border rounded-xl text-center text-gray-400 font-medium transition-all hover:border-gray-500">
+                                        Avito
+                                    </div>
+                                </label>
+                                
+                                <label class="relative cursor-pointer">
+                                    <input type="checkbox" name="platforms" value="auto_ru" checked class="peer sr-only platform-checkbox">
+                                    <div class="p-3 bg-omni-bg border border-omni-border rounded-xl text-center text-gray-400 font-medium transition-all hover:border-gray-500">
+                                        Auto.ru
+                                    </div>
+                                </label>
+
+                                <label class="relative cursor-pointer">
+                                    <input type="checkbox" name="platforms" value="dns" class="peer sr-only platform-checkbox">
+                                    <div class="p-3 bg-omni-bg border border-omni-border rounded-xl text-center text-gray-400 font-medium transition-all hover:border-gray-500">
+                                        DNS Shop
+                                    </div>
+                                </label>
+
+                                <label class="relative cursor-pointer">
+                                    <input type="checkbox" name="platforms" value="ozon" class="peer sr-only platform-checkbox">
+                                    <div class="p-3 bg-omni-bg border border-omni-border rounded-xl text-center text-gray-400 font-medium transition-all hover:border-gray-500">
+                                        Ozon (Global)
+                                    </div>
+                                </label>
+                            </div>
+                        </div>
+
+                        <!-- 3. Бюджет и базовые параметры -->
+                        <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+                            <div>
+                                <label class="block text-xs uppercase text-gray-500 font-bold mb-2">Мин. Цена (₽)</label>
+                                <input type="number" id="min_price" placeholder="0" class="w-full bg-omni-bg border border-omni-border rounded-lg px-4 py-3 text-white font-mono focus:border-blue-500">
+                            </div>
+                            <div>
+                                <label class="block text-xs uppercase text-gray-500 font-bold mb-2">Макс. Цена (₽)</label>
+                                <input type="number" id="max_price" placeholder="Не ограничено" class="w-full bg-omni-bg border border-omni-border rounded-lg px-4 py-3 text-white font-mono focus:border-blue-500">
+                            </div>
+                            <div>
+                                <label class="block text-xs uppercase text-gray-500 font-bold mb-2">Регион сканирования</label>
+                                <input type="text" id="target_region" value="Ульяновск" class="w-full bg-omni-bg border border-omni-border rounded-lg px-4 py-3 text-white focus:border-blue-500">
+                            </div>
+                        </div>
+
+                        <!-- ==========================================
+                             STRICT MODE (УБИЙЦА АВТОПОДБОРА)
+                             ========================================== -->
+                        <div class="border border-red-500/30 rounded-xl p-4 md:p-6 bg-red-900/10 relative overflow-hidden">
+                            <div class="absolute top-0 right-0 bg-red-500 text-white text-[10px] font-bold px-3 py-1 rounded-bl-lg">STRICT MODE</div>
+                            
+                            <div class="flex items-center mb-4">
+                                <svg class="w-5 h-5 text-red-500 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path></svg>
+                                <h3 class="text-white font-semibold">Безжалостные фильтры</h3>
+                            </div>
+                            
+                            <p class="text-xs text-gray-400 mb-5">В этом режиме движок удалит любые результаты, которые не соответствуют точным критериям. Идеально для отсева спама.</p>
+
+                            <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mb-4">
+                                <!-- Точная модель -->
+                                <div class="col-span-1 md:col-span-2">
+                                    <label class="block text-xs text-gray-400 mb-1">Точная модель (Исключить мусор)</label>
+                                    <input type="text" id="strict_model" placeholder="Напр: iPhone 13 Pro (отсечет обычный 13)" class="w-full bg-omni-bg border border-red-500/30 rounded-lg px-3 py-2.5 text-white font-mono text-sm focus:border-red-500">
+                                </div>
+                                
+                                <!-- Состояние -->
+                                <div>
+                                    <label class="block text-xs text-gray-400 mb-1">Состояние</label>
+                                    <select id="strict_condition" class="w-full bg-omni-bg border border-red-500/30 rounded-lg px-3 py-2.5 text-white text-sm focus:border-red-500">
+                                        <option value="">Любое (Игнорировать)</option>
+                                        <option value="new">Только Новое (Запечатанное)</option>
+                                        <option value="used">Только Б/У</option>
+                                        <option value="broken">На запчасти (Broken)</option>
+                                    </select>
+                                </div>
+
+                                <!-- Тип продавца -->
+                                <div>
+                                    <label class="block text-xs text-gray-400 mb-1">Тип продавца</label>
+                                    <select id="strict_seller" class="w-full bg-omni-bg border border-red-500/30 rounded-lg px-3 py-2.5 text-white text-sm focus:border-red-500">
+                                        <option value="private">Частник (Отсев перекупов)</option>
+                                        <option value="company">Компания / Дилер</option>
+                                        <option value="any">Любой</option>
+                                    </select>
+                                </div>
+                            </div>
+
+                            <!-- Специфичные фильтры для Авто (ДТП, Год, Владельцы) -->
+                            <div class="border-t border-red-500/20 pt-4 grid grid-cols-2 md:grid-cols-4 gap-3">
+                                <div>
+                                    <label class="block text-xs text-gray-400 mb-1">Год ОТ</label>
+                                    <input type="number" id="strict_year_from" placeholder="2015" class="w-full bg-omni-bg border border-red-500/30 rounded-lg px-3 py-2 text-white font-mono text-sm">
+                                </div>
+                                <div>
+                                    <label class="block text-xs text-gray-400 mb-1">Владельцев ДО</label>
+                                    <input type="number" id="strict_owners" placeholder="2" class="w-full bg-omni-bg border border-red-500/30 rounded-lg px-3 py-2 text-white font-mono text-sm">
+                                </div>
+                                
+                                <!-- Чекбоксы -->
+                                <label class="relative cursor-pointer flex flex-col justify-end">
+                                    <input type="checkbox" id="strict_no_accidents" class="peer sr-only strict-toggle">
+                                    <div class="p-2 bg-omni-bg border border-red-500/30 rounded-lg text-center text-gray-400 text-xs font-medium transition-all">
+                                        Строго без ДТП
+                                    </div>
+                                </label>
+
+                                <label class="relative cursor-pointer flex flex-col justify-end">
+                                    <input type="checkbox" id="strict_check_scam" checked class="peer sr-only strict-toggle">
+                                    <div class="p-2 bg-omni-bg border border-red-500/30 rounded-lg text-center text-gray-400 text-xs font-medium transition-all">
+                                        OSINT Проверка на Скам
+                                    </div>
+                                </label>
+                            </div>
+                        </div>
+
+                        <!-- Кнопка запуска -->
+                        <button type="submit" id="btn-submit" class="w-full bg-blue-600 hover:bg-blue-500 text-white font-bold py-4 px-6 rounded-xl transition-all transform hover:scale-[1.01] active:scale-95 flex justify-center items-center shadow-[0_0_20px_rgba(59,130,246,0.4)]">
+                            <svg class="w-6 h-6 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path></svg>
+                            <span id="btn-text" class="tracking-widest uppercase">Инициализировать Парсинг</span>
+                            
+                            <!-- Лоадер -->
+                            <svg id="btn-loader" class="animate-spin -ml-1 mr-3 h-6 w-6 text-white hidden" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                                <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                                <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                            </svg>
+                        </button>
+                    </div>
+                </form>
+
+                <!-- ==========================================
+                     ЗОНА ВЫДАЧИ РЕЗУЛЬТАТОВ
+                     ========================================== -->
+                <div id="results-container" class="hidden space-y-4 pb-10">
+                    
+                    <!-- Статистика отсева -->
+                    <div class="flex justify-between items-center px-2">
+                        <h2 class="text-xl font-bold text-white">Найденные цели</h2>
+                        <div class="text-xs text-gray-400 bg-omni-panel px-3 py-1 rounded-lg border border-omni-border">
+                            Отсеяно мусора: <span id="stat-filtered" class="text-red-400 font-bold">0</span> | 
+                            Прошло фильтр: <span id="stat-passed" class="text-green-400 font-bold">0</span>
+                        </div>
+                    </div>
+
+                    <!-- Сетка карточек (Сюда JS будет инжектить HTML) -->
+                    <div id="results-grid" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">
+                        <!-- Карточки генерируются скриптом -->
+                    </div>
+                </div>
+
+            </div>
+        </div>
+    </main>
+
+    <!-- ==========================================
+         МОДАЛЬНОЕ ОКНО: НАСТРОЙКИ (API КЛЮЧИ)
+         ========================================== -->
+    <div id="modal-settings" class="fixed inset-0 bg-black/80 z-[100] hidden flex justify-center items-center px-4 backdrop-blur-sm">
+        <div class="glass-panel w-full max-w-md rounded-2xl p-6 border border-omni-border shadow-2xl transform scale-95 transition-transform" id="modal-settings-content">
+            <h3 class="text-xl font-bold text-white mb-4">Настройки Системы</h3>
+            
+            <div class="space-y-4">
+                <div>
+                    <label class="block text-xs text-gray-400 mb-1">OmniScan API Key (Бэкенд)</label>
+                    <input type="password" id="setting_api_key" placeholder="Введи секретный ключ из main.py" class="w-full bg-omni-bg border border-omni-border rounded-lg px-4 py-3 text-white font-mono text-sm focus:border-blue-500">
+                </div>
+                <div>
+                    <label class="block text-xs text-gray-400 mb-1">IP сервера бэкенда</label>
+                    <input type="text" id="setting_server_ip" value="http://localhost:8000" class="w-full bg-omni-bg border border-omni-border rounded-lg px-4 py-3 text-white font-mono text-sm focus:border-blue-500">
+                </div>
+            </div>
+
+            <div class="mt-6 flex justify-end space-x-3">
+                <button onclick="closeSettings()" class="px-4 py-2 rounded-lg bg-gray-700 hover:bg-gray-600 text-white text-sm font-medium transition-colors">Отмена</button>
+                <button onclick="saveSettings()" class="px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-500 text-white text-sm font-bold transition-colors">Сохранить в Память</button>
+            </div>
+        </div>
+    </div>
+
+
+    <!-- ==========================================
+         4. JAVASCRIPT: ЯДРО ФРОНТЕНДА
+         ========================================== -->
+    <script>
+        class OmniScanFrontend {
+            constructor() {
+                this.apiUrl = localStorage.getItem('omniscan_server') || 'http://localhost:8000';
+                this.apiKey = localStorage.getItem('omniscan_key') || '';
+                
+                this.elements = {
+                    form: document.getElementById('omni-scanner-form'),
+                    btnText: document.getElementById('btn-text'),
+                    btnLoader: document.getElementById('btn-loader'),
+                    scanFx: document.getElementById('scan-fx'),
+                    resultsContainer: document.getElementById('results-container'),
+                    resultsGrid: document.getElementById('results-grid'),
+                    statFiltered: document.getElementById('stat-filtered'),
+                    statPassed: document.getElementById('stat-passed'),
+                    statusDots: [document.getElementById('connection-status'), document.getElementById('desktop-conn-status')],
+                    statusText: document.getElementById('server-status-text')
+                };
+
+                this.init();
+            }
+
+            init() {
+                // Восстановление настроек
+                document.getElementById('setting_server_ip').value = this.apiUrl;
+                document.getElementById('setting_api_key').value = this.apiKey;
+
+                // Слушатель формы
+                this.elements.form.addEventListener('submit', (e) => this.handleScan(e));
+
+                // Проверка здоровья сервера
+                this.checkServerHealth();
+            }
+
+            async checkServerHealth() {
+                try {
+                    const response = await fetch(`${this.apiUrl}/api/v1/status`);
+                    if (response.ok) {
+                        this.updateStatus(true, "Сервер ОНЛАЙН");
+                    } else {
+                        this.updateStatus(false, "Ошибка авторизации");
+                    }
+                } catch (e) {
+                    this.updateStatus(false, "Сервер ОФФЛАЙН");
+                }
+            }
+
+            updateStatus(isOnline, text) {
+                const color = isOnline ? 'bg-green-500 shadow-[0_0_8px_#10B981]' : 'bg-red-500 shadow-[0_0_8px_#EF4444]';
+                this.elements.statusDots.forEach(dot => {
+                    if(dot) dot.className = `w-3 h-3 rounded-full ${color}`;
+                });
+                if(this.elements.statusText) this.elements.statusText.innerText = text;
+            }
+
+            collectFormData() {
+                // Сбор площадок
+                const platforms = Array.from(document.querySelectorAll('input[name="platforms"]:checked')).map(cb => cb.value);
+                
+                // Формирование JSON под Pydantic модель backend'а
+                return {
+                    target: document.getElementById('target_query').value,
+                    region: document.getElementById('target_region').value,
+                    platforms: platforms.length > 0 ? platforms : ["avito"], // Фоллбэк
+                    min_price: parseFloat(document.getElementById('min_price').value) || null,
+                    max_price: parseFloat(document.getElementById('max_price').value) || null,
+                    strict_filters: {
+                        exact_model: document.getElementById('strict_model').value || null,
+                        condition: document.getElementById('strict_condition').value || null,
+                        no_accidents: document.getElementById('strict_no_accidents').checked,
+                        year_from: parseInt(document.getElementById('strict_year_from').value) || null,
+                        extra_props: {
+                            max_owners: parseInt(document.getElementById('strict_owners').value) || null,
+                            check_scam: document.getElementById('strict_check_scam').checked,
+                            seller_type: document.getElementById('strict_seller').value
+                        }
+                    }
+                };
+            }
+
+            async handleScan(e) {
+                e.preventDefault();
+                
+                // UI: Загрузка
+                this.elements.btnText.classList.add('hidden');
+                this.elements.btnLoader.classList.remove('hidden');
+                this.elements.scanFx.classList.remove('hidden');
+                this.elements.resultsContainer.classList.add('hidden');
+
+                const requestData = this.collectFormData();
+                console.log("[OmniScan] Отправка payload:", requestData);
+
+                try {
+                    // Пытаемся отправить реальный запрос на бэкенд
+                    const response = await fetch(`${this.apiUrl}/api/v1/scan`, {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'X-API-KEY': this.apiKey
+                        },
+                        body: JSON.stringify(requestData)
+                    });
+
+                    if (!response.ok) {
+                        throw new Error(`HTTP error! status: ${response.status}`);
+                    }
+
+                    const data = await response.json();
+                    
+                    // Бэкенд у нас асинхронный (в фоне), поэтому для демонстрации UI
+                    // мы сгенерируем Моковые данные на основе фильтров пользователя
+                    setTimeout(() => this.renderMockResults(requestData), 1500);
+
+                } catch (error) {
+                    console.error("[OmniScan] Ошибка API:", error);
+                    alert("Бэкенд недоступен или неверный API ключ. Запускаю демо-рендер для проверки UI.");
+                    
+                    // Фоллбэк: показываем, как работал бы интерфейс, даже если бэкенда нет
+                    setTimeout(() => this.renderMockResults(requestData), 1000);
+                } finally {
+                    setTimeout(() => {
+                        this.elements.btnText.classList.remove('hidden');
+                        this.elements.btnLoader.classList.add('hidden');
+                        this.elements.scanFx.classList.add('hidden');
+                    }, 1500);
+                }
+            }
+
+            renderMockResults(filters) {
+                // Это генератор мок-данных исключительно для визуала. 
+                // В проде сюда будет прилетать массив JSON из базы.
+                
+                let html = '';
+                const itemsCount = Math.floor(Math.random() * 5) + 3; // 3-7 элементов
+                
+                // Статистика
+                this.elements.statFiltered.innerText = Math.floor(Math.random() * 150) + 20; // Отсеяно мусора
+                this.elements.statPassed.innerText = itemsCount;
+
+                for(let i = 0; i < itemsCount; i++) {
+                    const isPereKup = filters.strict_filters.extra_props.seller_type === 'private' ? false : (Math.random() > 0.7);
+                    const price = filters.min_price ? filters.min_price + (Math.random() * 5000) : Math.floor(Math.random() * 50000) + 5000;
+                    
+                    html += `
+                    <div class="glass-panel rounded-xl overflow-hidden border border-omni-border hover:border-blue-500/50 transition-all transform hover:-translate-y-1">
+                        <!-- Изображение -->
+                        <div class="h-40 bg-omni-bg relative border-b border-omni-border flex items-center justify-center">
+                            <svg class="w-12 h-12 text-gray-700" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z"></path></svg>
+                            
+                            <!-- Бейджики -->
+                            <div class="absolute top-2 left-2 flex flex-col gap-1">
+                                <span class="bg-blue-600 text-white text-[10px] font-bold px-2 py-1 rounded shadow">${filters.platforms[0].toUpperCase()}</span>
+                                ${filters.strict_filters.condition === 'new' ? '<span class="bg-green-600 text-white text-[10px] font-bold px-2 py-1 rounded shadow">НОВЫЙ</span>' : ''}
+                            </div>
+                            
+                            <!-- Метка перекупа -->
+                            ${isPereKup ? '<div class="absolute bottom-2 right-2 bg-red-600/90 backdrop-blur text-white text-[10px] font-bold px-2 py-1 rounded shadow border border-red-400">⚠️ ВОЗМОЖНО ПЕРЕКУП</div>' : '<div class="absolute bottom-2 right-2 bg-green-600/90 backdrop-blur text-white text-[10px] font-bold px-2 py-1 rounded shadow border border-green-400">✅ ЧАСТНИК</div>'}
+                        </div>
+                        
+                        <!-- Информация -->
+                        <div class="p-4">
+                            <h4 class="text-white font-bold text-lg mb-1 truncate" title="${filters.target}">${filters.target} ${filters.strict_filters.exact_model || ''}</h4>
+                            <div class="text-blue-400 font-mono text-xl font-bold mb-3">${Math.floor(price).toLocaleString('ru-RU')} ₽</div>
+                            
+                            <div class="text-xs text-gray-400 space-y-1 mb-4 font-mono">
+                                <div>Регион: <span class="text-gray-200">${filters.region}</span></div>
+                                <div>Парсинг: <span class="text-green-400">ПРОШЕЛ STRICT ФИЛЬТР</span></div>
+                            </div>
+                            
+                            <!-- Кнопки действия -->
+                            <div class="flex gap-2">
+                                <button class="flex-1 bg-omni-bg border border-omni-border hover:bg-gray-800 text-white text-xs font-bold py-2 rounded-lg transition-colors">
+                                    Открыть
+                                </button>
+                                <button class="flex-[2] bg-gradient-to-r from-amber-600 to-amber-500 hover:from-amber-500 hover:to-amber-400 text-black text-xs font-black py-2 rounded-lg transition-colors flex items-center justify-center" onclick="alert('iVizion PRO требуется для глубокого анализа продавца')">
+                                    <svg class="w-4 h-4 mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path></svg>
+                                    iVizion Анализ
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                    `;
+                }
+
+                this.elements.resultsGrid.innerHTML = html;
+                this.elements.resultsContainer.classList.remove('hidden');
+                
+                // Плавный скролл к результатам
+                this.elements.resultsContainer.scrollIntoView({ behavior: 'smooth', block: 'start' });
+            }
+        }
+
+        // Инициализация при загрузке
+        const app = new OmniScanFrontend();
+
+        // Управление модалкой
+        function openSettings() {
+            const modal = document.getElementById('modal-settings');
+            const content = document.getElementById('modal-settings-content');
+            modal.classList.remove('hidden');
+            setTimeout(() => content.classList.remove('scale-95'), 10);
+        }
+
+        function closeSettings() {
+            const modal = document.getElementById('modal-settings');
+            const content = document.getElementById('modal-settings-content');
+            content.classList.add('scale-95');
+            setTimeout(() => modal.classList.add('hidden'), 200);
+        }
+
+        function saveSettings() {
+            const ip = document.getElementById('setting_server_ip').value;
+            const key = document.getElementById('setting_api_key').value;
+            
+            localStorage.setItem('omniscan_server', ip);
+            localStorage.setItem('omniscan_key', key);
+            
+            app.apiUrl = ip;
+            app.apiKey = key;
+            app.checkServerHealth();
+            
+            closeSettings();
+            alert("Настройки сохранены локально на устройстве.");
+        }
+    </script>
+</body>
+</html>
+
+
