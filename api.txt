@@ -1,0 +1,476 @@
+================================================================================
+                    MARKETVISION CORE: PUBLIC API REGISTRY
+                       (RU / KZ / US / GLOBAL MARKETS)
+================================================================================
+Версия базы: 2.5.0
+Языковая поддержка: RU / EN
+Формат авторизации:
+  [NO_KEY]    - Полностью бесплатный открытый API без токена
+  [FREE_KEY]  - Требуется бесплатная регистрация для получения API Key
+  [REVERSE]   - Публичные эндпоинты фронтенда/мобильных приложений
+================================================================================
+
+================================================================================
+1. КЛАССИФАЙДЫ, МАРКЕТПЛЕЙСЫ И АВТО-РЫНОК (RU / KZ / US)
+================================================================================
+
+1.1. РОССИЯ (RU)
+001. Wildberries Catalog API [NO_KEY]
+     URL: https://search.wb.ru/exactmatch/ru/common/v4/search
+     Назначение: Поиск товаров, получение цен, остатков, скидок и брендов.
+     Параметры: ?query={query}&dest={city_dest}&priceU={min};{max}&page={page}
+
+002. Wildberries Product Card Details [NO_KEY]
+     URL: https://basket-{shard}.wb.ru/vol{vol}/part{part}/{id}/info/data.json
+     Назначение: Полная информация о товаре, продавце, складах и характеристиках.
+
+003. Ozon Public Search [REVERSE]
+     URL: https://api.ozon.ru/composer-api.bx/page/json/v2
+     Назначение: Поиск товаров на Ozon через открытый эндпоинт мобильного SPA.
+     Параметры: ?url=/category/{category}/?text={query}
+
+004. Avito Mobile Gateway [REVERSE]
+     URL: https://m.avito.ru/api/9/items
+     Назначение: Выгрузка объявлений б/у рынка (авто, электроника) по городам.
+     Параметры: ?locationId={id}&categoryId={cat}&query={query}
+
+005. Drom.ru Auto Search [REVERSE]
+     URL: https://auto.drom.ru/ajax/search/
+     Назначение: Каталог подержанных автомобилей по регионам РФ.
+
+006. DNS Catalog Public Gateway [REVERSE]
+     URL: https://www.dns-shop.ru/catalog/json/
+     Назначение: Мониторинг актуальных цен и наличия техники в розничных магазинах.
+
+1.2. КАЗАХСТАН (KZ)
+007. Kolesa.kz Auto Classifieds [REVERSE]
+     URL: https://kolesa.kz/a/ajax-find-similar/
+     Назначение: Рынок б/у авто Казахстана, цены в тенге (KZT), проверка дубликатов.
+
+008. Kolesa.kz Listing API [REVERSE]
+     URL: https://m.kolesa.kz/ms/car/v1/products/{product_id}
+     Назначение: Полное досье на автомобиль в Казахстане (пробег, VIN, город, продавец).
+
+009. Krisha.kz Real Estate & Goods [REVERSE]
+     URL: https://krisha.kz/a/ajax-analytics/
+     Назначение: Анализ динамики цен и проверка контактных данных продавцов в KZ.
+
+010. Kaspi.kz Storefront Search [REVERSE]
+     URL: https://kaspi.kz/yml/product-view/services/catalog/category/{category_id}
+     Назначение: Главный маркетплейс Казахстана (электроника, бытовые товары, автотовары).
+
+1.3. США И МИРОВОЙ РЫНОК (US / GLOBAL)
+011. eBay Finding API [FREE_KEY]
+     URL: https://svcs.ebay.com/services/search/FindingService/v1
+     Назначение: Поиск б/у и новых товаров на американском и мировом рынке eBay.
+
+012. Craigslist RSS Feeds [NO_KEY]
+     URL: https://{city}.craigslist.org/search/{category}?format=rss
+     Назначение: Сбор локальных б/у объявлений в США без блокировок.
+
+013. FakeStoreAPI [NO_KEY]
+     URL: https://fakestoreapi.com/products
+     Назначение: Мок-каталог для тестирования UI и алгоритмов фильтрации.
+
+014. DummyJSON Products [NO_KEY]
+     URL: https://dummyjson.com/products
+     Назначение: Тестовая база из 100+ товаров с пагинацией, скидками и рейтингом.
+
+015. Platzi Fake Store API [NO_KEY]
+     URL: https://api.escuelajs.co/api/v1/products
+     Назначение: Категоризированная база товаров для стресс-тестов UI.
+
+================================================================================
+2. АВТОМОБИЛИ, VIN И ТРАНСПОРТНЫЙ OSINT (AUTO DOSSIER)
+================================================================================
+
+016. NHTSA VIN Decoder [NO_KEY]
+     URL: https://vpic.nhtsa.dot.gov/api/vehicles/DecodeVinValues/{vin}?format=json
+     Назначение: Глобальная расшифровка VIN (марка, модель, год, завод сборки, мотор).
+
+017. NHTSA Vehicle Recalls API [NO_KEY]
+     URL: https://api.nhtsa.gov/recalls/recallsByVin?vin={vin}
+     Назначение: Проверка отзывных кампаний автопроизводителей по VIN.
+
+018. NHTSA Vehicle Safety Ratings [NO_KEY]
+     URL: https://api.nhtsa.gov/SafetyRatings/modelyear/{year}/make/{make}/model/{model}
+     Назначение: Краш-тесты и рейтинги безопасности моделей авто.
+
+019. CarQuery API [NO_KEY]
+     URL: https://www.carqueryapi.com/api/0.3/
+     Назначение: Полная база технических характеристик машин с 1941 года по сей день.
+
+020. Open Charge Map API [FREE_KEY]
+     URL: https://api.openchargemap.io/v3/poi/
+     Назначение: База зарядных станций для электромобилей (для фильтра электрокаров).
+
+021. Nomerogram Scraper Gateway [REVERSE]
+     URL: https://www.nomerogram.ru/n/{plate}/
+     Назначение: Поиск фотографий машины в прошлом по российским и казахстанским номерам.
+
+022. Gibdd Web Scraper Check [REVERSE]
+     URL: https://check.gibdd.ru/proxy/check/auto/history
+     Назначение: Официальная проверка истории регистраций и периодов владения в РФ.
+
+023. RSA (Rostransnadzor / Insurance check) [REVERSE]
+     URL: https://dkbm-web.autoins.ru/dkbm-web-1.0/policy.htm
+     Назначение: Проверка наличия и истории полисов ОСАГО / КАСКО.
+
+================================================================================
+3. КУРСЫ ВАЛЮТ, ФИНАНСЫ И ЦЕНООБРАЗОВАНИЕ (FX & REGIONAL PRICING)
+================================================================================
+
+024. Frankfurter Currency API [NO_KEY]
+     URL: https://api.frankfurter.app/latest
+     Назначение: Официальные курсы ЕЦБ без ключей (конвертация USD, EUR, RUB, KZT).
+
+025. Central Bank of Russia (CBR) XML [NO_KEY]
+     URL: https://www.cbr.ru/scripts/XML_daily.asp
+     Назначение: Официальный курс валют ЦБ РФ на текущий день в XML.
+
+026. National Bank of Kazakhstan (NBKZ) [NO_KEY]
+     URL: https://nationalbank.kz/rss/rates_all.xml
+     Назначение: Официальные курсы валют Национального Банка Республики Казахстан.
+
+027. ExchangeRate-API [FREE_KEY]
+     URL: https://v6.exchangerate-api.com/v6/{key}/latest/{base}
+     Назначение: Конвертер 160+ мировых валют с обновлением раз в час.
+
+028. Open Exchange Rates [FREE_KEY]
+     URL: https://openexchangerates.org/api/latest.json
+     Назначение: Исторические курсы для построения графиков инфляции цен.
+
+029. CoinGecko Crypto Rates [NO_KEY]
+     URL: https://api.coingecko.com/api/v3/simple/price
+     Назначение: Мониторинг курсов крипты (для покупок через USDT/BTC).
+
+030. CoinCap API [NO_KEY]
+     URL: https://api.coincap.io/v2/assets
+     Назначение: Альтернативный бесплатный источник крипто-котировок в реальном времени.
+
+================================================================================
+4. ГЕОЛОКАЦИЯ, КАРТЫ И IP-АНАЛИТИКА (GEO INTELLIGENCE)
+================================================================================
+
+031. OpenStreetMap Nominatim Geocoding [NO_KEY]
+     URL: https://nominatim.openstreetmap.org/search
+     Назначение: Прямое геокодирование городов РФ, KZ и мира (получение координат).
+
+032. Nominatim Reverse Geocoding [NO_KEY]
+     URL: https://nominatim.openstreetmap.org/reverse
+     Назначение: Получение адреса и города по GPS координатам (lat/lon).
+
+033. DaData Clean Address [FREE_KEY]
+     URL: https://cleaner.dadata.ru/api/v1/clean/address
+     Назначение: Стандартизация адресов и городов РФ/СНГ по КЛАДР/ФИАС.
+
+034. IP-API.com [NO_KEY]
+     URL: http://ip-api.com/json/{ip}
+     Назначение: Определение города пользователя по IP без ключей (лимит 45 req/min).
+
+035. IPInfo.io [FREE_KEY]
+     URL: https://ipinfo.io/{ip}/geo
+     Назначение: Глубокая геолокация IP, определение хостинга/VPN продавца.
+
+036. REST Countries v3.1 [NO_KEY]
+     URL: https://restcountries.com/v3.1/name/{country}
+     Назначение: Справочные данные о странах (валюты, языки, флаги, телефонные коды).
+
+037. Zippopotam.us Postal Codes [NO_KEY]
+     URL: https://api.zippopotam.us/{country}/{postal-code}
+     Назначение: Поиск городов по почтовому индексу (поддержка US, RU и др.).
+
+038. Geoapify Geocoding API [FREE_KEY]
+     URL: https://api.geoapify.com/v1/geocode/search
+     Назначение: Бесплатный геокодер с автодополнением названий улиц.
+
+039. BigDataCloud Reverse Geocoding [FREE_KEY]
+     URL: https://api.bigdatacloud.net/data/reverse-geocode-client
+     Назначение: Быстрое клиентское определение местоположения без авторизации.
+
+================================================================================
+5. ИСКУССТВЕННЫЙ ИНТЕЛЛЕКТ, VISION И OCR (AI CORE)
+================================================================================
+
+040. Ollama Local API [NO_KEY]
+     URL: http://localhost:11434/api/generate
+     Назначение: Локальный запуск vision-моделей (llama3.2-vision, llava) без лимитов.
+
+041. Ollama Chat Endpoint [NO_KEY]
+     URL: http://localhost:11434/api/chat
+     Назначение: Диалог с мультимодальной нейросетью с сохранением контекста фото.
+
+042. Hugging Face Inference API [FREE_KEY]
+     URL: https://api-inference.huggingface.co/models/{model_id}
+     Назначение: Бесплатный запуск open-source моделей классификации изображений.
+
+043. OCR.Space Free OCR API [FREE_KEY]
+     URL: https://api.ocr.space/parse/image
+     Назначение: Распознавание текста с фото (VIN-коды под стеклом, текст на чеках).
+
+044. Groq Cloud AI API [FREE_KEY]
+     URL: https://api.groq.com/openai/v1/chat/completions
+     Назначение: Сверхбыстрый LLM-анализ описаний объявлений (Llama-3-70B, Mixtral).
+
+045. DeepAI Image Recognition [FREE_KEY]
+     URL: https://api.deepai.org/api/image-similarity
+     Назначение: Поиск дубликатов фотографий для вычисления фейковых объявлений.
+
+046. Cloudmersive Computer Vision [FREE_KEY]
+     URL: https://api.cloudmersive.com/image/recognize/describe
+     Назначение: Автоматическое описание повреждений на фото автомобиля.
+
+047. Clarifai Public Vision API [FREE_KEY]
+     URL: https://api.clarifai.com/v2/models/{model_id}/outputs
+     Назначение: Детекция объектов на фото (машины, вмятины, сколы).
+
+048. Together AI Engine [FREE_KEY]
+     URL: https://api.together.xyz/v1/chat/completions
+     Назначение: Доступ к открытым моделям компьютерного зрения.
+
+================================================================================
+6. OSINT, БЕЗОПАСНОСТЬ И АНТИФРОД ПРОДАВЦОВ (ANTI-FRAUD)
+================================================================================
+
+049. HaveIBeenPwned Account Breaches [FREE_KEY]
+     URL: https://haveibeenpwned.com/api/v3/breachedaccount/{account}
+     Назначение: Проверка утечек email продавца в базах сливов.
+
+050. EmailRep.io Reputation Engine [FREE_KEY]
+     URL: https://emailrep.io/{email}
+     Назначение: Оценка доверия к email продавца (возраст домена, спам-активность).
+
+051. Abstract Phone Verification [FREE_KEY]
+     URL: https://phonevalidation.abstractapi.com/v1/
+     Назначение: Валидация телефонного номера (оператор, страна, тип: мобильный/VoIP).
+
+052. Numverify Phone Lookup [FREE_KEY]
+     URL: http://apilayer.net/api/validate
+     Назначение: Проверка валидности номеров телефонов в РФ (+7) и США (+1).
+
+053. Discard.email Domain Checker [NO_KEY]
+     URL: https://ev.hetras.net/api/v1/is-temporary-mail/{domain}
+     Назначение: Детекция временных/одноразовых почт у подозрительных продавцов.
+
+054. VirusTotal Public API [FREE_KEY]
+     URL: https://www.virustotal.com/api/v3/urls
+     Назначение: Проверка ссылок от продавцов на фишинг и вредоносные скрипты.
+
+055. URLScan.io Web Sandbox [FREE_KEY]
+     URL: https://urlscan.io/api/v1/scan/
+     Назначение: Безопасный снимок и анализ подозрительных доменов магазинов.
+
+056. Shodan Host Investigation [FREE_KEY]
+     URL: https://api.shodan.io/shodan/host/{ip}
+     Назначение: Поиск открытых портов и уязвимостей на серверах магазинов.
+
+057. IPQualityScore Fraud Detection [FREE_KEY]
+     URL: https://ipqualityscore.com/api/json/ip/{key}/{ip}
+     Назначение: Вычисление фрод-скора (вероятность спама/мошенничества) от 0 до 100.
+
+058. StopForumSpam Lookup [NO_KEY]
+     URL: https://api.stopforumspam.org/api?ip={ip}&email={email}&json
+     Назначение: Проверка контактов продавца по глобальной базе спамеров.
+
+================================================================================
+7. ВЕБ-ПОИСК, OSINT-РАЗВЕДКА И КРАУЛИНГ (SEARCH ENGINES)
+================================================================================
+
+059. DuckDuckGo HTML Search [NO_KEY]
+     URL: https://html.duckduckgo.com/html/
+     Назначение: Анонимный сбор результатов поиска без блокировок и ключей.
+
+060. DuckDuckGo Instant Answer API [NO_KEY]
+     URL: https://api.duckduckgo.com/
+     Назначение: Мгновенные карточки товаров и фактов в JSON формате (?q={query}&format=json).
+
+061. Serper.dev Google Search [FREE_KEY]
+     URL: https://google.serper.dev/search
+     Назначение: Быстрый сбор органической выдачи Google по отзывам о продавце.
+
+062. SerpApi Google / Yandex [FREE_KEY]
+     URL: https://serpapi.com/search.json
+     Назначение: Парсинг выдачи Яндекса, Google и YouTube с обходом капчи.
+
+063. Jina Reader AI Web Scraper [NO_KEY]
+     URL: https://r.jina.ai/{url}
+     Назначение: Превращение любого URL товара в чистый Markdown текст для ИИ.
+
+064. Wayback Machine Archive API [NO_KEY]
+     URL: https://archive.org/wayback/available?url={url}
+     Назначение: Просмотр истории изменения карточки товара и старых цен.
+
+065. ScrapingAnt Proxy Engine [FREE_KEY]
+     URL: https://api.scrapingant.com/v2/general
+     Назначение: Рендеринг JS-страниц и обход Cloudflare при скрапинге.
+
+066. ScraperAPI Web Gateway [FREE_KEY]
+     URL: http://api.scraperapi.com/
+     Назначение: Автоматическая ротация резидентных прокси для б/у площадок.
+
+================================================================================
+8. ЛОКАЛИЗАЦИЯ И ПЕРЕВОД (RU / EN LOCALIZATION)
+================================================================================
+
+067. LibreTranslate Engine [FREE_KEY / NO_KEY]
+     URL: https://libretranslate.com/translate
+     Назначение: Открытый перевод описаний товаров между RU и EN.
+
+068. MyMemory Translation API [NO_KEY]
+     URL: https://api.mymemory.translated.net/get
+     Назначение: Бесплатный перевод строк интерфейса (до 1000 слов/день без ключа).
+     Параметры: ?q={text}&langpair=ru|en
+
+069. Lingva Translate (Google Mirror) [NO_KEY]
+     URL: https://lingva.ml/api/v1/{source}/{target}/{query}
+     Назначение: Быстрый перевод карточек товаров без трекеров и ограничений.
+
+070. DeepL Free API [FREE_KEY]
+     URL: https://api-free.deepl.com/v2/translate
+     Назначение: Высокоточный нейросетевой перевод для англоязычного рынка.
+
+071. FunTranslations API [FREE_KEY]
+     URL: https://api.funtranslations.com/translate/
+     Назначение: Вспомогательный эндпоинт для трансформации текста.
+
+================================================================================
+9. БАЗЫ ШТРИХКОДОВ И СПРАВОЧНИКИ ТОВАРОВ (BARCODES & UPC)
+================================================================================
+
+072. UPCitemdb Product Lookup [FREE_KEY]
+     URL: https://api.upcitemdb.com/prod/trial/lookup?upc={barcode}
+     Назначение: Поиск названия, характеристик и картинок товара по штрихкоду.
+
+073. Open Food Facts API [NO_KEY]
+     URL: https://world.openfoodfacts.org/api/v2/product/{barcode}.json
+     Назначение: Глобальная открытая база продуктов питания и составов.
+
+074. Open Beauty Facts API [NO_KEY]
+     URL: https://world.openbeautyfacts.org/api/v2/product/{barcode}.json
+     Назначение: База косметики и парфюмерии (для парсинга WB и Ozon).
+
+075. Open Products Facts [NO_KEY]
+     URL: https://world.openproductsfacts.org/api/v0/product/{barcode}.json
+     Назначение: Универсальный справочник любых потребительских товаров.
+
+076. Barcode Spider API [FREE_KEY]
+     URL: https://api.barcodespider.com/v1/lookup
+     Назначение: Поиск брендов электроники по EAN/UPC кодам.
+
+077. EAN Search Engine [FREE_KEY]
+     URL: https://api.ean-search.org/api
+     Назначение: Валидация подлинности штрихкодов европейских и американских товаров.
+
+================================================================================
+10. PUSH-УВЕДОМЛЕНИЯ, МЕССЕНДЖЕРЫ И ВЕБХУКИ (NOTIFICATIONS)
+================================================================================
+
+078. Firebase Cloud Messaging (FCM) [FREE_KEY]
+     URL: https://fcm.googleapis.com/v1/projects/{project_id}/messages:send
+     Назначение: Мгновенная доставка PUSH-уведомлений на Android APK.
+
+079. OneSignal REST API [FREE_KEY]
+     URL: https://onesignal.com/api/v1/notifications
+     Назначение: Альтернативный PUSH-шлюз для мобильных и веб-уведомлений.
+
+080. Telegram Bot API [FREE_KEY]
+     URL: https://api.telegram.org/bot{token}/sendMessage
+     Назначение: Дублирование найденных скидок и компромата в Telegram-канал/чат.
+
+081. Telegram Webhook Updates [FREE_KEY]
+     URL: https://api.telegram.org/bot{token}/setWebhook
+     Назначение: Прием команд от пользователей через Telegram-бота.
+
+082. Discord Webhooks [NO_KEY]
+     URL: https://discord.com/api/webhooks/{webhook.id}/{webhook.token}
+     Назначение: Отправка карточек с найденными автомобилями в Discord сервер.
+
+083. Pushover API [FREE_KEY]
+     URL: https://api.pushover.net/1/messages.json
+     Назначение: Экстренные уведомления о падении цен для PRO-пользователей.
+
+084. Pushbullet API [FREE_KEY]
+     URL: https://api.pushbullet.com/v2/pushes
+     Назначение: Синхронизация уведомлений между ПК и мобильным клиентом.
+
+085. ntfy.sh Open Push Service [NO_KEY]
+     URL: https://ntfy.sh/{topic}
+     Назначение: Отправка HTTP POST push-уведомлений без авторизации и регистрации.
+
+================================================================================
+11. ПОГОДА И РЕГИОНАЛЬНЫЕ ДАННЫЕ (ENVIRONMENT CONTEXT)
+================================================================================
+
+086. Open-Meteo Weather Forecast [NO_KEY]
+     URL: https://api.open-meteo.com/v1/forecast
+     Назначение: Погода в городе поиска (для автоподбора: оценка условий осмотра).
+     Параметры: ?latitude={lat}&longitude={lon}&current_weather=true
+
+087. WeatherAPI.com [FREE_KEY]
+     URL: https://api.weatherapi.com/v1/current.json
+     Назначение: Точный прогноз погоды и архив для анализа фото авто (дождь/снег).
+
+088. OpenWeatherMap Free API [FREE_KEY]
+     URL: https://api.openweathermap.org/data/2.5/weather
+     Назначение: Текущие погодные условия по названию города.
+
+089. Sunrise and Sunset API [NO_KEY]
+     URL: https://api.sunrisesunset.io/json
+     Назначение: Определение светового дня (помогает ИИ оценить освещение на фото).
+
+090. AirVisual Air Quality API [FREE_KEY]
+     URL: https://api.airvisual.com/v2/city
+     Назначение: Анализ чистоты воздуха в регионе продавца.
+
+================================================================================
+12. СТАТИЧЕСКИЙ BACKEND, GITOPS И ХРАНИЛИЩА (INFRASTRUCTURE)
+================================================================================
+
+091. GitHub REST API [FREE_KEY / NO_KEY]
+     URL: https://api.github.com/repos/{owner}/{repo}/contents/{path}
+     Назначение: Чтение и запись спарсенных JSON-файлов прямо в репозиторий.
+
+092. GitHub Releases API [NO_KEY]
+     URL: https://api.github.com/repos/{owner}/{repo}/releases/latest
+     Назначение: Автоматическая проверка обновлений собранного APK файла.
+
+093. Supabase REST API [FREE_KEY]
+     URL: https://{project_ref}.supabase.co/rest/v1/{table}
+     Назначение: Облачная PostgreSQL база данных для синхронизации PRO-пользователей.
+
+094. JSONBin.io Cloud JSON Store [FREE_KEY]
+     URL: https://api.jsonbin.io/v3/b
+     Назначение: Временное облачное хранилище для черных списков (Blacklist).
+
+095. Mocki.io API Generator [NO_KEY]
+     URL: https://mocki.io/fake-json-api
+     Назначение: Генерация статических API-точек для тестирования мобильного клиента.
+
+096. CountAPI (Hit Counter) [NO_KEY]
+     URL: https://api.countapi.xyz/hit/{namespace}/{key}
+     Назначение: Бесплатный учет просмотров объявлений и переходов по реферальным ссылкам.
+
+097. IPFS Public Gateway (Cloudflare) [NO_KEY]
+     URL: https://cloudflare-ipfs.com/ipfs/{cid}
+     Назначение: Децентрализованное хранение фото компромата и отчетов.
+
+098. Pastebin API [FREE_KEY]
+     URL: https://pastebin.com/api/api_post.php
+     Назначение: Экспорт длинных отчетов по автомобилям во внешние текстовые дампы.
+
+099. ImgBB Free Image Hosting API [FREE_KEY]
+     URL: https://api.imgbb.com/1/upload
+     Назначение: Временный хостинг аватарок пользователей и сжатых фото товаров.
+
+100. Cloudinary Image Management [FREE_KEY]
+     URL: https://api.cloudinary.com/v1_1/{cloud_name}/image/upload
+     Назначение: Оптимизация и ресайз фотографий перед отправкой в Vision AI.
+
+101. QR Code Generator API [NO_KEY]
+     URL: https://api.qrserver.com/v1/create-qr-code/
+     Назначение: Генерация QR-кодов для реферальных ссылок и быстрого шеринга товаров.
+     Параметры: ?size=150x150&data={url}
+
+================================================================================
+                      КОНЕЦ РЕГИСТРА PUBLIC APIS
+================================================================================
