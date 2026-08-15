@@ -1,694 +1,610 @@
 <!DOCTYPE html>
-<html lang="ru">
+<html lang="ru" class="dark">
 <head>
     <meta charset="UTF-8">
+    <!-- Оптимизация под мобильные устройства и Webview (Sketchware) -->
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
-    <title>MarketVision - OSINT & AI Scanner</title>
+    <meta name="theme-color" content="#0f172a">
+    <title>OmniScan | Ultimate OSINT Engine</title>
     
-    <!-- Tailwind CSS (CDN) -->
+    <!-- Подключаем Tailwind (через CDN для удобства в одном файле) -->
     <script src="https://cdn.tailwindcss.com"></script>
     <script>
         tailwind.config = {
+            darkMode: 'class',
             theme: {
                 extend: {
-                    colors: { 
-                        brand: { 50: '#eff6ff', 100: '#dbeafe', 500: '#3b82f6', 600: '#2563eb', 900: '#1e3a8a' },
-                        dark: '#0f172a'
+                    colors: {
+                        omni: {
+                            bg: '#0B0F19',
+                            panel: '#151C2C',
+                            border: '#2A3441',
+                            accent: '#3B82F6',
+                            danger: '#EF4444',
+                            warning: '#F59E0B',
+                            success: '#10B981'
+                        }
                     },
-                    animation: { 
-                        'fade-in': 'fadeIn 0.4s cubic-bezier(0.4, 0, 0.2, 1)',
-                        'slide-up': 'slideUp 0.5s cubic-bezier(0.4, 0, 0.2, 1)',
-                        'pulse-fast': 'pulse 1.5s cubic-bezier(0.4, 0, 0.6, 1) infinite',
-                        'bounce-x': 'bounceX 1s infinite'
+                    animation: {
+                        'pulse-slow': 'pulse 3s cubic-bezier(0.4, 0, 0.6, 1) infinite',
+                        'scan-line': 'scan 2s linear infinite',
                     },
-                    keyframes: { 
-                        fadeIn: { '0%': { opacity: '0' }, '100%': { opacity: '1' } },
-                        slideUp: { '0%': { opacity: '0', transform: 'translateY(20px)' }, '100%': { opacity: '1', transform: 'translateY(0)' } },
-                        bounceX: { '0%, 100%': { transform: 'translateX(0)' }, '50%': { transform: 'translateX(25%)' } }
+                    keyframes: {
+                        scan: {
+                            '0%': { transform: 'translateY(-100%)' },
+                            '100%': { transform: 'translateY(1000%)' }
+                        }
                     }
                 }
             }
         }
     </script>
 
-    <!-- Google Fonts -->
-    <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
-    
     <style>
-        /* Сброс и базовые настройки */
-        * { -webkit-tap-highlight-color: transparent; box-sizing: border-box; }
-        body { font-family: 'Manrope', sans-serif; background-color: #f8fafc; overflow: hidden; }
+        /* ==========================================
+           1. КАСТОМНЫЕ СТИЛИ И АНИМАЦИИ
+           ========================================== */
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;700&display=swap');
         
-        /* Утилиты скрытия и скролла */
-        .hidden-force { display: none !important; }
-        .no-scrollbar::-webkit-scrollbar { display: none; }
-        .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
-        
-        /* Стили чата */
-        .chat-bubble-mine { background: linear-gradient(135deg, #2563eb, #1e40af); color: white; border-radius: 20px 20px 4px 20px; box-shadow: 0 4px 15px rgba(37, 99, 235, 0.2); }
-        .chat-bubble-other { background: #ffffff; color: #1e293b; border: 1px solid #e2e8f0; border-radius: 20px 20px 20px 4px; box-shadow: 0 2px 10px rgba(0,0,0,0.02); }
-        .chat-bubble-ai { background: linear-gradient(135deg, #0f172a, #1e293b); color: white; border-radius: 20px 20px 20px 4px; border: 1px solid #334155; box-shadow: 0 4px 15px rgba(0,0,0,0.1); }
-        
-        /* Анимация точек печатания ИИ */
-        .typing-dot { animation: typing 1.4s infinite ease-in-out both; }
-        .typing-dot:nth-child(1) { animation-delay: -0.32s; }
-        .typing-dot:nth-child(2) { animation-delay: -0.16s; }
-        @keyframes typing { 0%, 80%, 100% { transform: scale(0); } 40% { transform: scale(1); } }
-        
-        /* Тени и эффекты */
-        .glass-nav { background: rgba(255, 255, 255, 0.85); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); border-top: 1px solid rgba(226, 232, 240, 0.8); }
-        .toast { position: fixed; top: 20px; left: 50%; transform: translateX(-50%) translateY(-100px); opacity: 0; transition: all 0.4s cubic-bezier(0.68, -0.55, 0.265, 1.55); z-index: 9999; }
-        .toast.show { transform: translateX(-50%) translateY(0); opacity: 1; }
-        
-        /* Модальное окно досье */
-        .modal-overlay { background: rgba(15, 23, 42, 0.6); backdrop-filter: blur(4px); opacity: 0; transition: opacity 0.3s ease; pointer-events: none; }
-        .modal-overlay.active { opacity: 1; pointer-events: auto; }
-        .modal-content { transform: translateY(100%); transition: transform 0.4s cubic-bezier(0.16, 1, 0.3, 1); }
-        .modal-overlay.active .modal-content { transform: translateY(0); }
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #0B0F19;
+            color: #E2E8F0;
+            overflow-x: hidden;
+            -webkit-tap-highlight-color: transparent;
+        }
+
+        .font-mono { font-family: 'JetBrains Mono', monospace; }
+
+        /* Стилизация скроллбара под хакерский интерфейс */
+        ::-webkit-scrollbar { width: 6px; height: 6px; }
+        ::-webkit-scrollbar-track { background: #0B0F19; }
+        ::-webkit-scrollbar-thumb { background: #3B82F6; border-radius: 3px; }
+        ::-webkit-scrollbar-thumb:hover { background: #2563EB; }
+
+        /* Glassmorphism панели */
+        .glass-panel {
+            background: rgba(21, 28, 44, 0.7);
+            backdrop-filter: blur(12px);
+            -webkit-backdrop-filter: blur(12px);
+            border: 1px solid rgba(255, 255, 255, 0.05);
+            box-shadow: 0 4px 30px rgba(0, 0, 0, 0.5);
+        }
+
+        /* Кастомные чекбоксы-кнопки */
+        .platform-checkbox:checked + div {
+            background-color: rgba(59, 130, 246, 0.2);
+            border-color: #3B82F6;
+            color: #fff;
+        }
+
+        .strict-toggle:checked + div {
+            background-color: rgba(239, 68, 68, 0.2);
+            border-color: #EF4444;
+            color: #fff;
+        }
+
+        /* Глитч-эффект для PRO статуса */
+        .glitch-text {
+            position: relative;
+            display: inline-block;
+        }
+        .pro-badge {
+            background: linear-gradient(90deg, #F59E0B, #FCD34D);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            font-weight: 900;
+            text-shadow: 0 0 10px rgba(245, 158, 11, 0.3);
+        }
     </style>
 </head>
-<body class="text-gray-900 h-screen flex flex-col relative">
+<body class="flex flex-col h-screen md:flex-row pb-20 md:pb-0">
 
-    <!-- SPLASH SCREEN -->
-    <div id="splashScreen" class="fixed inset-0 bg-dark z-[100] flex flex-col items-center justify-center transition-opacity duration-700">
-        <div class="relative w-24 h-24 mb-6">
-            <div class="absolute inset-0 border-4 border-brand-500 rounded-full animate-ping opacity-20"></div>
-            <div class="absolute inset-2 border-4 border-brand-400 rounded-full animate-spin border-t-transparent"></div>
-            <div class="absolute inset-0 flex items-center justify-center text-white font-black text-2xl tracking-tighter">MV</div>
-        </div>
-        <h1 class="text-white text-3xl font-extrabold tracking-tight mb-2">MarketVision</h1>
-        <p class="text-slate-400 text-sm font-semibold tracking-widest uppercase">Инициализация систем OSINT...</p>
-    </div>
-
-    <!-- TOAST NOTIFICATION -->
-    <div id="toast" class="toast bg-gray-900 text-white px-6 py-3 rounded-full font-bold shadow-2xl flex items-center gap-2">
-        <svg class="w-5 h-5 text-green-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="3" d="M5 13l4 4L19 7"></path></svg>
-        <span id="toastMsg">Успешно!</span>
-    </div>
-
-    <!-- ========================================== -->
-    <!-- СТРАНИЦА: ЛЕНТА И ПОИСК (FEED)             -->
-    <!-- ========================================== -->
-    <main id="view-feed" class="flex-1 overflow-y-auto pb-28 pt-8 px-4 max-w-4xl mx-auto w-full no-scrollbar relative z-10">
-        <div class="flex justify-between items-center mb-6">
-            <h1 class="text-4xl font-extrabold tracking-tighter text-gray-900">Поиск<span class="text-brand-600">.</span></h1>
-            <div class="bg-brand-50 text-brand-600 px-3 py-1 rounded-full text-xs font-black tracking-widest uppercase border border-brand-100">
-                Live 24/7
-            </div>
-        </div>
+    <!-- ==========================================
+         2. БОКОВАЯ/НИЖНЯЯ ПАНЕЛЬ НАВИГАЦИИ (Адаптив)
+         ========================================== -->
+    <nav class="glass-panel fixed bottom-0 w-full md:relative md:w-20 lg:w-64 md:h-screen z-50 flex md:flex-col justify-around md:justify-start items-center md:items-start p-3 md:p-4 border-t md:border-t-0 md:border-r border-omni-border transition-all">
         
-        <!-- Блок жестких фильтров -->
-        <div class="bg-white p-6 rounded-3xl shadow-[0_8px_30px_rgb(0,0,0,0.04)] border border-gray-100 mb-8">
-            <div class="relative mb-5">
-                <svg class="w-6 h-6 absolute left-4 top-3.5 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"></path></svg>
-                <input type="text" id="searchInput" placeholder="Марка, модель или запрос..." class="w-full pl-12 pr-4 py-3.5 bg-gray-50 border border-gray-200 rounded-2xl focus:outline-none focus:ring-2 focus:ring-brand-500 font-bold text-gray-900 transition-all placeholder:font-medium">
-            </div>
-            
-            <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-5">
-                <div class="col-span-2">
-                    <label class="block text-[10px] font-black text-gray-400 uppercase tracking-widest mb-1.5 pl-1">Город</label>
-                    <input type="text" id="cityInput" value="Ульяновск" class="w-full p-3 bg-gray-50 border border-gray-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-brand-500 font-bold text-gray-800">
-                </div>
-                <div>
-                    <label class="block text-[10px] font-black text-gray-400 uppercase tracking-widest mb-1.5 pl-1">Цена ОТ</label>
-                    <input type="number" id="minPriceInput" placeholder="0" class="w-full p-3 bg-gray-50 border border-gray-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-brand-500 font-bold text-gray-800">
-                </div>
-                <div>
-                    <label class="block text-[10px] font-black text-gray-400 uppercase tracking-widest mb-1.5 pl-1">Цена ДО</label>
-                    <input type="number" id="maxPriceInput" placeholder="Макс" class="w-full p-3 bg-gray-50 border border-gray-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-brand-500 font-bold text-gray-800">
-                </div>
-            </div>
-
-            <!-- Сортировка -->
-            <div class="flex gap-2 mb-5 overflow-x-auto no-scrollbar pb-1">
-                <button class="filter-btn active bg-gray-900 text-white px-4 py-2 rounded-lg text-xs font-bold whitespace-nowrap transition-all" data-sort="all">Все категории</button>
-                <button class="filter-btn bg-gray-100 text-gray-600 hover:bg-gray-200 px-4 py-2 rounded-lg text-xs font-bold whitespace-nowrap transition-all" data-sort="auto">Автомобили</button>
-                <button class="filter-btn bg-gray-100 text-gray-600 hover:bg-gray-200 px-4 py-2 rounded-lg text-xs font-bold whitespace-nowrap transition-all" data-sort="tech">Техника</button>
-            </div>
-
-            <button onclick="App.renderFeed()" class="w-full bg-brand-600 hover:bg-brand-700 text-white font-extrabold py-4 rounded-2xl shadow-lg shadow-brand-500/30 transition-all active:scale-[0.98]">
-                Сканировать рынок
-            </button>
+        <!-- Логотип (только десктоп) -->
+        <div class="hidden md:flex items-center w-full mb-8 mt-2 px-2">
+            <svg class="w-8 h-8 text-blue-500 animate-pulse-slow" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 10l2 2m0 0l2-2m-2 2v4"></path></svg>
+            <span class="ml-3 font-bold text-xl tracking-widest hidden lg:block text-white">OMNI<span class="text-blue-500">SCAN</span></span>
         </div>
 
-        <!-- Контейнер ленты -->
-        <div id="feedContainer" class="space-y-5">
-            <!-- JS генерирует карточки -->
-        </div>
-    </main>
+        <!-- Кнопки навигации -->
+        <a href="#" class="nav-item group flex flex-col md:flex-row items-center w-full p-2 md:p-3 rounded-xl bg-blue-500/10 text-blue-500 md:mb-2">
+            <svg class="w-6 h-6 md:mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"></path></svg>
+            <span class="text-[10px] md:text-sm font-medium mt-1 md:mt-0 hidden md:block lg:block">Скан Рынка</span>
+        </a>
 
-    <!-- ========================================== -->
-    <!-- МОДАЛЬНОЕ ОКНО ДОСЬЕ (KOMPROMAT REPORT)    -->
-    <!-- ========================================== -->
-    <div id="dossierModal" class="fixed inset-0 modal-overlay z-[200] flex items-end sm:items-center justify-center">
-        <div class="modal-content bg-white w-full max-w-2xl sm:rounded-3xl rounded-t-3xl h-[85vh] sm:h-[80vh] flex flex-col shadow-2xl relative">
-            
-            <!-- Шапка модалки -->
-            <div class="absolute top-4 right-4 z-10 bg-white/50 backdrop-blur rounded-full p-1 cursor-pointer hover:bg-gray-100 transition-colors" onclick="App.closeDossier()">
-                <svg class="w-8 h-8 text-gray-800" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
-            </div>
-            
-            <!-- Контент досье (заполняется JS) -->
-            <div id="dossierContent" class="overflow-y-auto no-scrollbar flex-1 pb-10">
-                <!-- Template -->
-            </div>
-            
-            <!-- Подвал модалки (Кнопки действий) -->
-            <div class="border-t border-gray-100 p-4 bg-gray-50 rounded-b-3xl flex gap-3">
-                <button class="flex-1 bg-red-100 text-red-700 font-bold py-3.5 rounded-xl text-sm transition-colors hover:bg-red-200" onclick="App.showToast('Продавец добавлен в ЧС')">
-                    В Черный Список
-                </button>
-                <button class="flex-1 bg-brand-600 text-white font-bold py-3.5 rounded-xl text-sm shadow-md transition-colors hover:bg-brand-700" onclick="App.showToast('Ссылка скопирована')">
-                    Связаться с продавцом
-                </button>
-            </div>
-        </div>
-    </div>
+        <a href="#" class="nav-item group flex flex-col md:flex-row items-center w-full p-2 md:p-3 rounded-xl text-gray-400 hover:bg-white/5 hover:text-white transition-all md:mb-2">
+            <svg class="w-6 h-6 md:mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+            <span class="text-[10px] md:text-sm font-medium mt-1 md:mt-0 hidden md:block lg:block">История</span>
+        </a>
 
-    <!-- ========================================== -->
-    <!-- СТРАНИЦА: МЕССЕНДЖЕРЫ (CHAT)               -->
-    <!-- ========================================== -->
-    <main id="view-chat" class="flex-1 flex flex-col h-full bg-gray-50 hidden-force pb-[68px] w-full max-w-4xl mx-auto relative z-10">
-        <!-- Шапка чата -->
-        <div class="bg-white border-b border-gray-100 px-4 pt-8 pb-4 shadow-sm z-20">
-            <h1 class="text-3xl font-extrabold text-gray-900 mb-5 tracking-tight">Общение</h1>
-            <div class="flex bg-gray-100 p-1.5 rounded-2xl relative">
-                <!-- Ползунок индикатора активного таба -->
-                <div id="tabIndicator" class="absolute h-9 bg-white rounded-xl shadow-sm transition-all duration-300 ease-out z-0 w-[33%] left-1"></div>
-                
-                <button onclick="App.switchChatTab('global', 0)" class="chat-tab-btn flex-1 py-2 text-sm font-extrabold text-gray-900 z-10 transition-colors">Всемирный</button>
-                <button onclick="App.switchChatTab('friends', 1)" class="chat-tab-btn flex-1 py-2 text-sm font-bold text-gray-500 hover:text-gray-900 z-10 transition-colors">Друзья</button>
-                <button onclick="App.switchChatTab('ai', 2)" class="chat-tab-btn flex-1 py-2 text-sm font-bold text-gray-500 hover:text-gray-900 z-10 transition-colors">Vision AI</button>
-            </div>
+        <a href="#" class="nav-item group flex flex-col md:flex-row items-center w-full p-2 md:p-3 rounded-xl text-gray-400 hover:bg-white/5 hover:text-white transition-all md:mb-2">
+            <svg class="w-6 h-6 md:mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 8h2a2 2 0 012 2v6a2 2 0 01-2 2h-2v4l-4-4H9a1.994 1.994 0 01-1.414-.586m0 0L11 14h4a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2v4l.586-.586z"></path></svg>
+            <span class="text-[10px] md:text-sm font-medium mt-1 md:mt-0 hidden md:block lg:block">Чаты (P2P)</span>
+        </a>
+
+        <div class="hidden md:block flex-grow"></div>
+
+        <!-- iVizion Status -->
+        <div class="hidden lg:block w-full p-4 glass-panel rounded-xl border-omni-border mb-4 text-center cursor-pointer hover:border-amber-500 transition-colors">
+            <div class="text-xs text-gray-400 mb-1">Нейросеть iVizion</div>
+            <div class="pro-badge text-lg tracking-widest uppercase">Locked</div>
+            <div class="text-[10px] text-gray-500 mt-2">Требуется PRO-ключ</div>
         </div>
 
-        <!-- Поле ID (только для друзей) -->
-        <div id="friendIdBox" class="bg-white border-b border-gray-100 px-5 py-3 flex gap-3 items-center hidden-force shadow-sm z-10">
-            <span class="text-[10px] font-black text-brand-600 uppercase tracking-widest bg-brand-50 px-2 py-1 rounded-md">ID Цели</span>
-            <input type="text" id="friendIdInput" placeholder="Например: ID-X7B9A" class="flex-1 bg-transparent text-sm font-mono font-bold focus:outline-none uppercase text-gray-800">
-        </div>
-
-        <!-- Окно сообщений -->
-        <div id="chatMessages" class="flex-1 overflow-y-auto p-4 space-y-5 no-scrollbar bg-[url('data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMjAiIGhlaWdodD0iMjAiIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyI+PGNpcmNsZSBjeD0iMiIgY3k9IjIiIHI9IjIiIGZpbGw9IiNlNWU3ZWIiLz48L3N2Zz4=')]">
-            <!-- Сообщения -->
-        </div>
-
-        <!-- Индикатор печатания ИИ -->
-        <div id="aiTypingIndicator" class="hidden-force absolute bottom-24 left-4 z-20">
-            <div class="chat-bubble-ai px-4 py-3 flex gap-1 items-center w-min">
-                <div class="w-2 h-2 bg-gray-400 rounded-full typing-dot"></div>
-                <div class="w-2 h-2 bg-gray-400 rounded-full typing-dot"></div>
-                <div class="w-2 h-2 bg-gray-400 rounded-full typing-dot"></div>
-            </div>
-        </div>
-
-        <!-- Панель ввода -->
-        <div class="bg-white border-t border-gray-100 p-4 shadow-[0_-10px_20px_rgba(0,0,0,0.02)] z-20">
-            <div class="flex gap-2 relative max-w-3xl mx-auto">
-                <input type="text" id="chatInput" placeholder="Введите текст (смайлики удаляются)..." class="flex-1 bg-gray-50 border border-gray-200 rounded-2xl px-5 py-3.5 focus:outline-none focus:ring-2 focus:ring-brand-500 font-semibold text-gray-900 transition-all">
-                <button onclick="App.sendMessage()" class="bg-brand-600 hover:bg-brand-700 text-white rounded-2xl px-6 flex items-center justify-center transition-all active:scale-[0.95] shadow-lg shadow-brand-500/20">
-                    <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8"></path></svg>
-                </button>
-            </div>
-        </div>
-    </main>
-
-    <!-- ========================================== -->
-    <!-- СТРАНИЦА: ПРОФИЛЬ (PROFILE)                -->
-    <!-- ========================================== -->
-    <main id="view-profile" class="flex-1 overflow-y-auto pb-28 pt-10 px-5 max-w-lg mx-auto w-full hidden-force animate-fade-in relative z-10">
-        <h1 class="text-4xl font-extrabold text-center text-gray-900 mb-10 tracking-tighter">Настройки</h1>
-
-        <div class="bg-white rounded-[2rem] p-8 shadow-[0_8px_40px_rgb(0,0,0,0.04)] border border-gray-100 flex flex-col items-center">
-            
-            <!-- Аватарка -->
-            <div class="relative mb-8">
-                <div id="avatarPreview" class="w-36 h-36 rounded-full border-[6px] border-white outline outline-2 outline-gray-100 bg-gray-50 overflow-hidden shadow-inner flex items-center justify-center text-gray-300 relative z-10">
-                    <svg class="w-16 h-16" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z"></path></svg>
-                </div>
-                <!-- Кнопка загрузки -->
-                <label class="absolute bottom-1 right-1 z-20 bg-gray-900 hover:bg-black text-white p-3.5 rounded-full cursor-pointer shadow-xl transition-transform hover:scale-110 active:scale-95 border-4 border-white">
-                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M3 9a2 2 0 012-2h.93a2 2 0 001.664-.89l.812-1.22A2 2 0 0110.07 4h3.86a2 2 0 011.664.89l.812 1.22A2 2 0 0018.07 7H19a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V9z"></path></svg>
-                    <input type="file" accept="image/*" class="hidden" onchange="App.uploadAvatar(event)">
-                </label>
-            </div>
-
-            <!-- Данные -->
-            <div class="w-full space-y-6">
-                <!-- ID Block -->
-                <div class="bg-gray-50 rounded-2xl p-4 border border-gray-100 relative overflow-hidden group cursor-pointer" onclick="App.copyUserId()">
-                    <div class="absolute right-0 top-0 h-full w-12 bg-gradient-to-l from-gray-100 to-transparent"></div>
-                    <label class="block text-[10px] font-black text-brand-600 uppercase tracking-widest mb-1">Уникальный ID</label>
-                    <div id="userIdDisplay" class="font-mono font-bold text-gray-800 text-xl tracking-[0.2em]">ID-LOADING</div>
-                    <div class="absolute right-4 top-1/2 -translate-y-1/2 opacity-0 group-hover:opacity-100 transition-opacity text-gray-400">
-                        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
-                    </div>
-                </div>
-
-                <!-- Name Input -->
-                <div>
-                    <label class="block text-[10px] font-black text-gray-400 uppercase tracking-widest mb-1.5 pl-2">Ваше Имя</label>
-                    <input type="text" id="userNameInput" placeholder="Имя (Смайлы фильтруются)" class="w-full bg-gray-50 border border-gray-200 rounded-2xl px-5 py-4 font-extrabold text-gray-900 focus:outline-none focus:ring-2 focus:ring-brand-500 focus:bg-white text-lg transition-all shadow-sm">
-                </div>
-                
-                <button onclick="App.saveProfile()" class="w-full bg-brand-600 hover:bg-brand-700 text-white font-extrabold py-4 rounded-2xl shadow-lg shadow-brand-500/30 transition-all active:scale-[0.98] mt-4">
-                    Сохранить изменения
-                </button>
-            </div>
-            
-            <!-- Статистика -->
-            <div class="w-full grid grid-cols-2 gap-4 mt-8 pt-8 border-t border-gray-100">
-                <div class="text-center">
-                    <p class="text-3xl font-black text-gray-900">0</p>
-                    <p class="text-[10px] font-bold text-gray-400 uppercase tracking-widest">PRO-Дней</p>
-                </div>
-                <div class="text-center">
-                    <p class="text-3xl font-black text-gray-900">12</p>
-                    <p class="text-[10px] font-bold text-gray-400 uppercase tracking-widest">Проверок</p>
-                </div>
-            </div>
-        </div>
-    </main>
-
-    <!-- ========================================== -->
-    <!-- НИЖНЯЯ НАВИГАЦИЯ (BOTTOM NAVBAR)           -->
-    <!-- ========================================== -->
-    <nav class="fixed bottom-0 w-full glass-nav z-50 px-2 pb-safe">
-        <div class="flex justify-around items-center h-[72px] max-w-4xl mx-auto relative">
-            <!-- Индикатор активной страницы -->
-            <div id="navIndicator" class="absolute top-0 h-1 bg-brand-600 rounded-b-lg transition-all duration-300 ease-out w-8" style="left: 15%"></div>
-
-            <button onclick="App.switchPage('feed', 0)" id="nav-feed" class="nav-btn flex flex-col items-center justify-center w-full h-full space-y-1 text-brand-600 transition-colors">
-                <svg class="w-6 h-6 mb-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2.5"><path stroke-linecap="round" stroke-linejoin="round" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"></path></svg>
-                <span class="text-[10px] font-black tracking-widest">ПОИСК</span>
-            </button>
-
-            <button onclick="App.switchPage('chat', 1)" id="nav-chat" class="nav-btn flex flex-col items-center justify-center w-full h-full space-y-1 text-gray-400 hover:text-gray-900 transition-colors">
-                <div class="relative mb-0.5">
-                    <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2.5"><path stroke-linecap="round" stroke-linejoin="round" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z"></path></svg>
-                    <span class="absolute -top-1 -right-1 bg-red-500 w-2.5 h-2.5 rounded-full border-2 border-white animate-pulse"></span>
-                </div>
-                <span class="text-[10px] font-black tracking-widest">ЧАТЫ</span>
-            </button>
-
-            <button onclick="App.switchPage('profile', 2)" id="nav-profile" class="nav-btn flex flex-col items-center justify-center w-full h-full space-y-1 text-gray-400 hover:text-gray-900 transition-colors">
-                <svg class="w-6 h-6 mb-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2.5"><path stroke-linecap="round" stroke-linejoin="round" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z"></path></svg>
-                <span class="text-[10px] font-black tracking-widest">ПРОФИЛЬ</span>
-            </button>
-        </div>
+        <a href="#" onclick="openSettings()" class="nav-item group flex flex-col md:flex-row items-center w-full p-2 md:p-3 rounded-xl text-gray-400 hover:bg-white/5 hover:text-white transition-all">
+            <svg class="w-6 h-6 md:mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path></svg>
+            <span class="text-[10px] md:text-sm font-medium mt-1 md:mt-0 hidden md:block lg:block">Настройки</span>
+        </a>
     </nav>
 
-    <!-- ========================================== -->
-    <!-- JAVASCRIPT: ENTERPRISE АРХИТЕКТУРА         -->
-    <!-- ========================================== -->
-    <script>
-        // --- 1. ОГРОМНАЯ БАЗА ДАННЫХ (MOCKS) ---
-        const MOCK_DB = [
-            { 
-                id: 1, type: 'auto', title: 'Toyota Camry 2.5 AT, 2021', price: 3500000, oldPrice: 3800000, city: 'Ульяновск', platform: 'Avito', 
-                seller: 'Иван Петров', phone: '+7 (999) 111-22-33', isPerekup: true, hasAccidents: true, owners: 4, 
-                img: 'https://images.unsplash.com/photo-1621007947382-bb3c3994e3fd?auto=format&fit=crop&w=800&q=80',
-                vin: 'JTNB52K103012345',
-                history: [
-                    { date: '12.05.2021', event: 'Постановка на учет (Физ. лицо)' },
-                    { date: '04.09.2022', event: 'ДТП (Передний бампер, Капот)' },
-                    { date: '15.01.2023', event: 'Смена владельца' },
-                    { date: '20.08.2023', event: 'Пробег скручен на 40 000 км (Зафиксировано Автотекой)' }
-                ],
-                aiReport: 'На фото видны неравномерные зазоры между капотом и левым крылом. Цвет бампера незначительно отличается от кузова. ⚠️ ВЫСОКИЙ РИСК.'
-            },
-            { 
-                id: 2, type: 'tech', title: 'Apple MacBook Pro 16 M2 Max', price: 295000, oldPrice: null, city: 'Москва', platform: 'Ozon', 
-                seller: 'Premium Apple Shop', phone: 'Скрыт платформой', isPerekup: false, hasAccidents: false, owners: 0, 
-                img: 'https://images.unsplash.com/photo-1517336714731-489689fd1ca8?auto=format&fit=crop&w=800&q=80',
-                vin: 'Новый товар',
-                history: [{ date: '01.08.2026', event: 'Товар поступил на склад продавца' }],
-                aiReport: 'Упаковка заводская, пломбы на месте. Анализ отзывов продавца: 98% положительных, признаков ботофермы не выявлено. ✅ ЧИСТАЯ СДЕЛКА.'
-            },
-            { 
-                id: 3, type: 'auto', title: 'BMW X5 3.0d AT, 2019', price: 6200000, oldPrice: 6500000, city: 'Казань', platform: 'Auto.ru', 
-                seller: 'Официальный Дилер', phone: '+7 (800) 555-12-34', isPerekup: false, hasAccidents: false, owners: 1, 
-                img: 'https://images.unsplash.com/photo-1555215695-3004980ad54e?auto=format&fit=crop&w=800&q=80',
-                vin: 'WBA320I000111222',
-                history: [
-                    { date: '10.10.2019', event: 'Покупка в салоне (Юр. лицо)' },
-                    { date: 'Каждый год', event: 'Обслуживание только у ОД' }
-                ],
-                aiReport: 'Автомобиль в идеальном косметическом состоянии. Дефектов по кузову не обнаружено. Салон без следов износа. ✅ ОДОБРЕНО К ПОКУПКЕ.'
-            },
-            { 
-                id: 4, type: 'tech', title: 'Видеокарта GIGABYTE RTX 4090', price: 185000, oldPrice: 210000, city: 'Ульяновск', platform: 'DNS', 
-                seller: 'DNS (Ритейл)', phone: '8 (800) 770-79-99', isPerekup: false, hasAccidents: false, owners: 0, 
-                img: 'https://images.unsplash.com/photo-1591488320449-011701bb6704?auto=format&fit=crop&w=800&q=80',
-                vin: 'Чек + Гарантия 36 мес.',
-                history: [{ date: 'Сегодня', event: 'Снижение цены по всей сети DNS' }],
-                aiReport: 'Официальный магазин. Анализ цен показал падение на 11.9% за последние 48 часов. Рекомендуется к покупке. 📉 ВЫГОДА.'
-            }
-        ];
+    <!-- ==========================================
+         3. ГЛАВНАЯ РАБОЧАЯ ЗОНА
+         ========================================== -->
+    <main class="flex-1 flex flex-col h-full overflow-hidden relative">
+        
+        <!-- Header (Мобильный) -->
+        <header class="md:hidden glass-panel px-4 py-3 flex justify-between items-center z-40">
+            <div class="flex items-center">
+                <svg class="w-6 h-6 text-blue-500 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"></path></svg>
+                <span class="font-bold text-lg">OmniScan</span>
+            </div>
+            <div id="connection-status" class="w-3 h-3 rounded-full bg-red-500 shadow-[0_0_8px_#EF4444]"></div>
+        </header>
 
-        // --- 2. STATE MANAGER (Хранилище данных) ---
-        const Store = {
-            user: {
-                id: localStorage.getItem('mv_id') || ('ID-' + Math.random().toString(36).substr(2, 6).toUpperCase()),
-                name: localStorage.getItem('mv_name') || 'Аноним',
-                avatar: localStorage.getItem('mv_avatar') || null
-            },
-            chat: {
-                global: [{ id: 1, sender: 'Система', text: 'Добро пожаловать в безопасный чат.', time: '00:00', type: 'system' }],
-                friends: [],
-                ai: [{ id: 1, sender: 'Vision AI', text: 'Загрузите фото или опишите задачу. Я найду компромат на продавца.', time: '00:00', type: 'ai' }]
-            },
-            currentCategory: 'all',
-            saveUser() {
-                localStorage.setItem('mv_id', this.user.id);
-                localStorage.setItem('mv_name', this.user.name);
-                if (this.user.avatar) localStorage.setItem('mv_avatar', this.user.avatar);
-            }
-        };
-
-        // --- 3. CORE LOGIC (Контроллер Приложения) ---
-        const App = {
-            // Инициализация при старте
-            init() {
-                Store.saveUser();
-                document.getElementById('userIdDisplay').innerText = Store.user.id;
-                document.getElementById('userNameInput').value = Store.user.name;
-                if (Store.user.avatar) {
-                    document.getElementById('avatarPreview').innerHTML = `<img src="${Store.user.avatar}" class="w-full h-full object-cover">`;
-                }
-
-                // Защита инпутов (Жесткая вырезка смайлов)
-                this._bindInputs();
+        <!-- Рабочая область (Скроллируемая) -->
+        <div class="flex-1 overflow-y-auto p-4 md:p-8 custom-scrollbar relative">
+            
+            <div class="max-w-5xl mx-auto space-y-6">
                 
-                // Рендер стартовых экранов
-                this.renderFeed();
-                this.renderChat('global');
-
-                // Убираем Splash Screen через 1.5 секунды
-                setTimeout(() => {
-                    const splash = document.getElementById('splashScreen');
-                    splash.style.opacity = '0';
-                    setTimeout(() => splash.remove(), 700);
-                }, 1500);
-            },
-
-            // Биндинг эвентов для инпутов
-            _bindInputs() {
-                const stripFilter = (val) => val.replace(/[^\w\s.,!?"'а-яА-ЯёЁa-zA-Z0-9-()]/g, '');
-                
-                const chatInput = document.getElementById('chatInput');
-                chatInput.addEventListener('input', (e) => e.target.value = stripFilter(e.target.value));
-                chatInput.addEventListener('keypress', (e) => { if (e.key === 'Enter') App.sendMessage() });
-
-                const nameInput = document.getElementById('userNameInput');
-                nameInput.addEventListener('input', (e) => e.target.value = stripFilter(e.target.value));
-
-                // Логика кнопок категорий в поиске
-                document.querySelectorAll('.filter-btn').forEach(btn => {
-                    btn.addEventListener('click', (e) => {
-                        document.querySelectorAll('.filter-btn').forEach(b => {
-                            b.classList.remove('bg-gray-900', 'text-white');
-                            b.classList.add('bg-gray-100', 'text-gray-600');
-                        });
-                        e.target.classList.remove('bg-gray-100', 'text-gray-600');
-                        e.target.classList.add('bg-gray-900', 'text-white');
-                        Store.currentCategory = e.target.getAttribute('data-sort');
-                        App.renderFeed();
-                    });
-                });
-            },
-
-            // Навигация (Bottom Bar)
-            switchPage(pageId, index) {
-                // Прячем все
-                ['feed', 'chat', 'profile'].forEach(id => {
-                    document.getElementById(`view-${id}`).classList.add('hidden-force');
-                    document.getElementById(`nav-${id}`).classList.remove('text-brand-600');
-                    document.getElementById(`nav-${id}`).classList.add('text-gray-400');
-                });
-                // Показываем нужный
-                document.getElementById(`view-${pageId}`).classList.remove('hidden-force');
-                document.getElementById(`nav-${pageId}`).classList.remove('text-gray-400');
-                document.getElementById(`nav-${pageId}`).classList.add('text-brand-600');
-
-                // Анимация ползунка меню
-                const positions = ['15%', '48%', '82%'];
-                document.getElementById('navIndicator').style.left = positions[index];
-
-                if(pageId === 'chat') this.renderChat();
-            },
-
-            // --- МОДУЛЬ ЛЕНТЫ (FEED) ---
-            renderFeed() {
-                const container = document.getElementById('feedContainer');
-                const search = document.getElementById('searchInput').value.toLowerCase();
-                const city = document.getElementById('cityInput').value.toLowerCase();
-                const min = parseInt(document.getElementById('minPriceInput').value) || 0;
-                const max = parseInt(document.getElementById('maxPriceInput').value) || Infinity;
-
-                container.innerHTML = '';
-                
-                let results = 0;
-                MOCK_DB.forEach(item => {
-                    if (Store.currentCategory !== 'all' && item.type !== Store.currentCategory) return;
-                    if (search && !item.title.toLowerCase().includes(search)) return;
-                    if (city && !item.city.toLowerCase().includes(city)) return;
-                    if (item.price < min || item.price > max) return;
-                    
-                    results++;
-                    const priceDrop = item.oldPrice ? `<span class="text-xs text-green-500 font-bold bg-green-50 px-2 py-0.5 rounded ml-2">↓ Скидка</span>` : '';
-                    
-                    const card = `
-                    <div class="bg-white rounded-[1.5rem] p-4 shadow-[0_4px_20px_rgb(0,0,0,0.03)] border border-gray-100 animate-slide-up hover:shadow-lg transition-all cursor-pointer" onclick="App.openDossier(${item.id})">
-                        <div class="relative h-48 rounded-xl overflow-hidden mb-4">
-                            <img src="${item.img}" class="w-full h-full object-cover">
-                            <div class="absolute top-3 left-3 bg-white/95 backdrop-blur px-3 py-1.5 rounded-lg text-[10px] font-black text-gray-900 shadow-sm uppercase tracking-widest border border-gray-100">
-                                ${item.platform}
-                            </div>
-                        </div>
-                        <h3 class="text-xl font-extrabold text-gray-900 leading-tight mb-1">${item.title}</h3>
-                        <div class="flex items-center mb-3">
-                            <p class="text-2xl font-black text-brand-600">${item.price.toLocaleString()} ₽</p>
-                            ${priceDrop}
-                        </div>
-                        <div class="flex flex-wrap gap-1.5 mt-2">
-                            ${item.isPerekup ? '<span class="bg-red-50 text-red-700 px-2.5 py-1.5 rounded-lg text-[10px] font-black uppercase tracking-wider border border-red-100">Перекуп</span>' : '<span class="bg-green-50 text-green-700 px-2.5 py-1.5 rounded-lg text-[10px] font-black uppercase tracking-wider border border-green-100">Надежный</span>'}
-                            ${item.hasAccidents ? '<span class="bg-orange-50 text-orange-700 px-2.5 py-1.5 rounded-lg text-[10px] font-black uppercase tracking-wider border border-orange-100">ДТП</span>' : ''}
-                            <span class="bg-gray-100 text-gray-600 px-2.5 py-1.5 rounded-lg text-[10px] font-black uppercase tracking-wider">Владельцев: ${item.owners}</span>
-                        </div>
-                    </div>`;
-                    container.insertAdjacentHTML('beforeend', card);
-                });
-
-                if (results === 0) {
-                    container.innerHTML = `<div class="text-center py-12"><div class="text-5xl mb-4">🔍</div><h3 class="text-gray-900 font-bold text-lg">Ничего не найдено</h3><p class="text-gray-400 text-sm font-medium">Смягчите фильтры для поиска</p></div>`;
-                }
-            },
-
-            // --- МОДАЛЬНОЕ ОКНО (ДОСЬЕ) ---
-            openDossier(id) {
-                const item = MOCK_DB.find(i => i.id === id);
-                if(!item) return;
-
-                let historyHTML = item.history.map(h => `
-                    <div class="flex gap-4 relative mb-4">
-                        <div class="w-3 h-3 bg-brand-500 rounded-full mt-1.5 absolute -left-[23px] shadow-[0_0_0_4px_rgba(59,130,246,0.2)]"></div>
-                        <div>
-                            <p class="text-[10px] font-black text-gray-400 uppercase tracking-widest">${h.date}</p>
-                            <p class="text-sm font-bold text-gray-900">${h.event}</p>
-                        </div>
+                <!-- Заголовок страницы -->
+                <div class="flex justify-between items-end mb-8 hidden md:flex">
+                    <div>
+                        <h2 class="text-3xl font-bold text-white mb-2">OSINT Терминал</h2>
+                        <p class="text-gray-400">Настройте жесткие фильтры для поиска цели.</p>
                     </div>
-                `).join('');
-
-                const content = `
-                <div class="relative h-64 w-full rounded-t-3xl overflow-hidden shrink-0">
-                    <img src="${item.img}" class="w-full h-full object-cover">
-                    <div class="absolute inset-0 bg-gradient-to-t from-black/80 to-transparent"></div>
-                    <div class="absolute bottom-4 left-5 right-5 text-white">
-                        <p class="text-xs font-black uppercase tracking-widest text-brand-400 mb-1">${item.platform}</p>
-                        <h2 class="text-2xl font-extrabold leading-tight">${item.title}</h2>
+                    <div class="flex items-center space-x-2 text-sm text-gray-400 bg-omni-panel px-3 py-1 rounded-full border border-omni-border">
+                        <div id="desktop-conn-status" class="w-2 h-2 rounded-full bg-red-500"></div>
+                        <span id="server-status-text">Сервер оффлайн</span>
                     </div>
                 </div>
-                
-                <div class="p-6 space-y-6">
-                    <!-- Цена и контакты -->
-                    <div class="bg-gray-50 rounded-2xl p-5 border border-gray-100 shadow-inner">
-                        <p class="text-[10px] font-black text-gray-400 uppercase tracking-widest mb-1">Связь с продавцом</p>
-                        <div class="flex justify-between items-center">
+
+                <!-- ==========================================
+                     ФОРМА ПОИСКА (БЕЗЖАЛОСТНЫЕ ФИЛЬТРЫ)
+                     ========================================== -->
+                <form id="omni-scanner-form" class="glass-panel rounded-2xl p-5 md:p-8 shadow-2xl relative overflow-hidden">
+                    
+                    <!-- Декоративная линия сканера (анимация) -->
+                    <div class="absolute inset-0 w-full h-[2px] bg-blue-500/50 shadow-[0_0_15px_#3B82F6] animate-scan-line hidden pointer-events-none z-0" id="scan-fx"></div>
+
+                    <div class="relative z-10 space-y-8">
+                        
+                        <!-- 1. Базовый запрос -->
+                        <div>
+                            <label class="block text-xs uppercase tracking-widest text-gray-500 font-bold mb-3">Целевой запрос</label>
+                            <div class="relative">
+                                <input type="text" id="target_query" required placeholder="Например: Toyota Camry 2.5, Keenetic Giga, Квартира..." 
+                                       class="w-full bg-omni-bg border border-omni-border rounded-xl px-12 py-4 text-white text-lg focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 transition-all font-mono">
+                                <svg class="w-6 h-6 absolute left-4 top-4 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"></path></svg>
+                            </div>
+                        </div>
+
+                        <!-- 2. Выбор площадок (Custom Checkboxes) -->
+                        <div>
+                            <label class="block text-xs uppercase tracking-widest text-gray-500 font-bold mb-3">Векторы атаки (Площадки)</label>
+                            <div class="grid grid-cols-2 md:grid-cols-4 gap-3">
+                                
+                                <label class="relative cursor-pointer">
+                                    <input type="checkbox" name="platforms" value="avito" checked class="peer sr-only platform-checkbox">
+                                    <div class="p-3 bg-omni-bg border border-omni-border rounded-xl text-center text-gray-400 font-medium transition-all hover:border-gray-500">
+                                        Avito
+                                    </div>
+                                </label>
+                                
+                                <label class="relative cursor-pointer">
+                                    <input type="checkbox" name="platforms" value="auto_ru" checked class="peer sr-only platform-checkbox">
+                                    <div class="p-3 bg-omni-bg border border-omni-border rounded-xl text-center text-gray-400 font-medium transition-all hover:border-gray-500">
+                                        Auto.ru
+                                    </div>
+                                </label>
+
+                                <label class="relative cursor-pointer">
+                                    <input type="checkbox" name="platforms" value="dns" class="peer sr-only platform-checkbox">
+                                    <div class="p-3 bg-omni-bg border border-omni-border rounded-xl text-center text-gray-400 font-medium transition-all hover:border-gray-500">
+                                        DNS Shop
+                                    </div>
+                                </label>
+
+                                <label class="relative cursor-pointer">
+                                    <input type="checkbox" name="platforms" value="ozon" class="peer sr-only platform-checkbox">
+                                    <div class="p-3 bg-omni-bg border border-omni-border rounded-xl text-center text-gray-400 font-medium transition-all hover:border-gray-500">
+                                        Ozon (Global)
+                                    </div>
+                                </label>
+                            </div>
+                        </div>
+
+                        <!-- 3. Бюджет и базовые параметры -->
+                        <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
                             <div>
-                                <p class="text-lg font-extrabold text-gray-900">${item.seller}</p>
-                                <p class="font-mono font-bold text-brand-600 text-lg">${item.phone}</p>
+                                <label class="block text-xs uppercase text-gray-500 font-bold mb-2">Мин. Цена (₽)</label>
+                                <input type="number" id="min_price" placeholder="0" class="w-full bg-omni-bg border border-omni-border rounded-lg px-4 py-3 text-white font-mono focus:border-blue-500">
                             </div>
-                            <div class="text-right">
-                                <p class="text-2xl font-black text-gray-900">${item.price.toLocaleString()} ₽</p>
+                            <div>
+                                <label class="block text-xs uppercase text-gray-500 font-bold mb-2">Макс. Цена (₽)</label>
+                                <input type="number" id="max_price" placeholder="Не ограничено" class="w-full bg-omni-bg border border-omni-border rounded-lg px-4 py-3 text-white font-mono focus:border-blue-500">
+                            </div>
+                            <div>
+                                <label class="block text-xs uppercase text-gray-500 font-bold mb-2">Регион сканирования</label>
+                                <input type="text" id="target_region" value="Ульяновск" class="w-full bg-omni-bg border border-omni-border rounded-lg px-4 py-3 text-white focus:border-blue-500">
                             </div>
                         </div>
-                    </div>
 
-                    <!-- Отчет ИИ -->
-                    <div>
-                        <div class="flex items-center gap-2 mb-3">
-                            <svg class="w-5 h-5 text-brand-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M13 10V3L4 14h7v7l9-11h-7z"></path></svg>
-                            <h3 class="text-lg font-extrabold text-gray-900">Vision AI Отчет</h3>
+                        <!-- ==========================================
+                             STRICT MODE (УБИЙЦА АВТОПОДБОРА)
+                             ========================================== -->
+                        <div class="border border-red-500/30 rounded-xl p-4 md:p-6 bg-red-900/10 relative overflow-hidden">
+                            <div class="absolute top-0 right-0 bg-red-500 text-white text-[10px] font-bold px-3 py-1 rounded-bl-lg">STRICT MODE</div>
+                            
+                            <div class="flex items-center mb-4">
+                                <svg class="w-5 h-5 text-red-500 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path></svg>
+                                <h3 class="text-white font-semibold">Безжалостные фильтры</h3>
+                            </div>
+                            
+                            <p class="text-xs text-gray-400 mb-5">В этом режиме движок удалит любые результаты, которые не соответствуют точным критериям. Идеально для отсева спама.</p>
+
+                            <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mb-4">
+                                <!-- Точная модель -->
+                                <div class="col-span-1 md:col-span-2">
+                                    <label class="block text-xs text-gray-400 mb-1">Точная модель (Исключить мусор)</label>
+                                    <input type="text" id="strict_model" placeholder="Напр: iPhone 13 Pro (отсечет обычный 13)" class="w-full bg-omni-bg border border-red-500/30 rounded-lg px-3 py-2.5 text-white font-mono text-sm focus:border-red-500">
+                                </div>
+                                
+                                <!-- Состояние -->
+                                <div>
+                                    <label class="block text-xs text-gray-400 mb-1">Состояние</label>
+                                    <select id="strict_condition" class="w-full bg-omni-bg border border-red-500/30 rounded-lg px-3 py-2.5 text-white text-sm focus:border-red-500">
+                                        <option value="">Любое (Игнорировать)</option>
+                                        <option value="new">Только Новое (Запечатанное)</option>
+                                        <option value="used">Только Б/У</option>
+                                        <option value="broken">На запчасти (Broken)</option>
+                                    </select>
+                                </div>
+
+                                <!-- Тип продавца -->
+                                <div>
+                                    <label class="block text-xs text-gray-400 mb-1">Тип продавца</label>
+                                    <select id="strict_seller" class="w-full bg-omni-bg border border-red-500/30 rounded-lg px-3 py-2.5 text-white text-sm focus:border-red-500">
+                                        <option value="private">Частник (Отсев перекупов)</option>
+                                        <option value="company">Компания / Дилер</option>
+                                        <option value="any">Любой</option>
+                                    </select>
+                                </div>
+                            </div>
+
+                            <!-- Специфичные фильтры для Авто (ДТП, Год, Владельцы) -->
+                            <div class="border-t border-red-500/20 pt-4 grid grid-cols-2 md:grid-cols-4 gap-3">
+                                <div>
+                                    <label class="block text-xs text-gray-400 mb-1">Год ОТ</label>
+                                    <input type="number" id="strict_year_from" placeholder="2015" class="w-full bg-omni-bg border border-red-500/30 rounded-lg px-3 py-2 text-white font-mono text-sm">
+                                </div>
+                                <div>
+                                    <label class="block text-xs text-gray-400 mb-1">Владельцев ДО</label>
+                                    <input type="number" id="strict_owners" placeholder="2" class="w-full bg-omni-bg border border-red-500/30 rounded-lg px-3 py-2 text-white font-mono text-sm">
+                                </div>
+                                
+                                <!-- Чекбоксы -->
+                                <label class="relative cursor-pointer flex flex-col justify-end">
+                                    <input type="checkbox" id="strict_no_accidents" class="peer sr-only strict-toggle">
+                                    <div class="p-2 bg-omni-bg border border-red-500/30 rounded-lg text-center text-gray-400 text-xs font-medium transition-all">
+                                        Строго без ДТП
+                                    </div>
+                                </label>
+
+                                <label class="relative cursor-pointer flex flex-col justify-end">
+                                    <input type="checkbox" id="strict_check_scam" checked class="peer sr-only strict-toggle">
+                                    <div class="p-2 bg-omni-bg border border-red-500/30 rounded-lg text-center text-gray-400 text-xs font-medium transition-all">
+                                        OSINT Проверка на Скам
+                                    </div>
+                                </label>
+                            </div>
                         </div>
-                        <p class="text-sm font-semibold text-gray-700 leading-relaxed bg-brand-50 p-4 rounded-2xl border border-brand-100">${item.aiReport}</p>
-                    </div>
 
-                    <!-- История (Таймлайн) -->
-                    <div>
-                        <h3 class="text-lg font-extrabold text-gray-900 mb-5">История (${item.vin})</h3>
-                        <div class="border-l-2 border-gray-200 ml-2 pl-4">
-                            ${historyHTML}
+                        <!-- Кнопка запуска -->
+                        <button type="submit" id="btn-submit" class="w-full bg-blue-600 hover:bg-blue-500 text-white font-bold py-4 px-6 rounded-xl transition-all transform hover:scale-[1.01] active:scale-95 flex justify-center items-center shadow-[0_0_20px_rgba(59,130,246,0.4)]">
+                            <svg class="w-6 h-6 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path></svg>
+                            <span id="btn-text" class="tracking-widest uppercase">Инициализировать Парсинг</span>
+                            
+                            <!-- Лоадер -->
+                            <svg id="btn-loader" class="animate-spin -ml-1 mr-3 h-6 w-6 text-white hidden" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                                <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                                <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                            </svg>
+                        </button>
+                    </div>
+                </form>
+
+                <!-- ==========================================
+                     ЗОНА ВЫДАЧИ РЕЗУЛЬТАТОВ
+                     ========================================== -->
+                <div id="results-container" class="hidden space-y-4 pb-10">
+                    
+                    <!-- Статистика отсева -->
+                    <div class="flex justify-between items-center px-2">
+                        <h2 class="text-xl font-bold text-white">Найденные цели</h2>
+                        <div class="text-xs text-gray-400 bg-omni-panel px-3 py-1 rounded-lg border border-omni-border">
+                            Отсеяно мусора: <span id="stat-filtered" class="text-red-400 font-bold">0</span> | 
+                            Прошло фильтр: <span id="stat-passed" class="text-green-400 font-bold">0</span>
                         </div>
                     </div>
-                </div>`;
 
-                document.getElementById('dossierContent').innerHTML = content;
-                document.getElementById('dossierModal').classList.add('active');
-            },
+                    <!-- Сетка карточек (Сюда JS будет инжектить HTML) -->
+                    <div id="results-grid" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">
+                        <!-- Карточки генерируются скриптом -->
+                    </div>
+                </div>
 
-            closeDossier() {
-                document.getElementById('dossierModal').classList.remove('active');
-            },
+            </div>
+        </div>
+    </main>
 
-            // --- МОДУЛЬ ЧАТОВ ---
-            currentChat: 'global',
+    <!-- ==========================================
+         МОДАЛЬНОЕ ОКНО: НАСТРОЙКИ (API КЛЮЧИ)
+         ========================================== -->
+    <div id="modal-settings" class="fixed inset-0 bg-black/80 z-[100] hidden flex justify-center items-center px-4 backdrop-blur-sm">
+        <div class="glass-panel w-full max-w-md rounded-2xl p-6 border border-omni-border shadow-2xl transform scale-95 transition-transform" id="modal-settings-content">
+            <h3 class="text-xl font-bold text-white mb-4">Настройки Системы</h3>
             
-            switchChatTab(tab, index) {
-                this.currentChat = tab;
-                const positions = ['0%', '33.33%', '66.66%'];
-                document.getElementById('tabIndicator').style.left = positions[index];
+            <div class="space-y-4">
+                <div>
+                    <label class="block text-xs text-gray-400 mb-1">OmniScan API Key (Бэкенд)</label>
+                    <input type="password" id="setting_api_key" placeholder="Введи секретный ключ из main.py" class="w-full bg-omni-bg border border-omni-border rounded-lg px-4 py-3 text-white font-mono text-sm focus:border-blue-500">
+                </div>
+                <div>
+                    <label class="block text-xs text-gray-400 mb-1">IP сервера бэкенда</label>
+                    <input type="text" id="setting_server_ip" value="http://localhost:8000" class="w-full bg-omni-bg border border-omni-border rounded-lg px-4 py-3 text-white font-mono text-sm focus:border-blue-500">
+                </div>
+            </div>
 
-                document.querySelectorAll('.chat-tab-btn').forEach(btn => {
-                    btn.classList.remove('text-gray-900', 'font-extrabold');
-                    btn.classList.add('text-gray-500', 'font-bold');
-                });
-                event.target.classList.remove('text-gray-500', 'font-bold');
-                event.target.classList.add('text-gray-900', 'font-extrabold');
+            <div class="mt-6 flex justify-end space-x-3">
+                <button onclick="closeSettings()" class="px-4 py-2 rounded-lg bg-gray-700 hover:bg-gray-600 text-white text-sm font-medium transition-colors">Отмена</button>
+                <button onclick="saveSettings()" class="px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-500 text-white text-sm font-bold transition-colors">Сохранить в Память</button>
+            </div>
+        </div>
+    </div>
 
-                const friendBox = document.getElementById('friendIdBox');
-                if (tab === 'friends') friendBox.classList.remove('hidden-force');
-                else friendBox.classList.add('hidden-force');
 
-                this.renderChat();
-            },
-
-            renderChat() {
-                const container = document.getElementById('chatMessages');
-                container.innerHTML = '';
-                const msgs = Store.chat[this.currentChat];
-
-                if (msgs.length === 0) {
-                    container.innerHTML = `<div class="h-full flex items-center justify-center text-center"><p class="text-gray-400 font-bold text-sm bg-white p-4 rounded-2xl shadow-sm border border-gray-100">Здесь пусто.<br>Смайлы отключены фильтром безопасности.</p></div>`;
-                    return;
-                }
-
-                msgs.forEach(msg => {
-                    const isMe = msg.type === 'mine';
-                    const isAi = msg.type === 'ai';
-                    
-                    let bubbleClass = isMe ? 'chat-bubble-mine' : (isAi ? 'chat-bubble-ai' : 'chat-bubble-other');
-                    let alignClass = isMe ? 'items-end pl-12' : 'items-start pr-12';
-                    
-                    const html = `
-                    <div class="flex flex-col ${alignClass} animate-slide-up">
-                        <span class="text-[9px] font-black text-gray-400 mb-1 px-1 uppercase tracking-widest">
-                            ${msg.sender} • ${msg.time}
-                        </span>
-                        <div class="px-5 py-3.5 ${bubbleClass}">
-                            <p class="text-[14px] leading-relaxed font-semibold break-words">${msg.text}</p>
-                        </div>
-                    </div>`;
-                    container.insertAdjacentHTML('beforeend', html);
-                });
+    <!-- ==========================================
+         4. JAVASCRIPT: ЯДРО ФРОНТЕНДА
+         ========================================== -->
+    <script>
+        class OmniScanFrontend {
+            constructor() {
+                this.apiUrl = localStorage.getItem('omniscan_server') || 'http://localhost:8000';
+                this.apiKey = localStorage.getItem('omniscan_key') || '';
                 
-                this.scrollToBottom();
-            },
+                this.elements = {
+                    form: document.getElementById('omni-scanner-form'),
+                    btnText: document.getElementById('btn-text'),
+                    btnLoader: document.getElementById('btn-loader'),
+                    scanFx: document.getElementById('scan-fx'),
+                    resultsContainer: document.getElementById('results-container'),
+                    resultsGrid: document.getElementById('results-grid'),
+                    statFiltered: document.getElementById('stat-filtered'),
+                    statPassed: document.getElementById('stat-passed'),
+                    statusDots: [document.getElementById('connection-status'), document.getElementById('desktop-conn-status')],
+                    statusText: document.getElementById('server-status-text')
+                };
 
-            scrollToBottom() {
-                const container = document.getElementById('chatMessages');
-                container.scrollTop = container.scrollHeight;
-            },
-
-            sendMessage() {
-                const input = document.getElementById('chatInput');
-                let text = input.value.trim();
-                if (!text) return;
-
-                // Тотальная зачистка смайлов перед сохранением
-                text = text.replace(/[^\w\s.,!?"'а-яА-ЯёЁa-zA-Z0-9-()]/g, '');
-
-                const now = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-
-                if (this.currentChat === 'friends') {
-                    const fId = document.getElementById('friendIdInput').value;
-                    if (!fId) return this.showToast('Укажите ID друга!');
-                }
-
-                Store.chat[this.currentChat].push({
-                    id: Date.now(), sender: Store.user.name, text: text, time: now, type: 'mine'
-                });
-
-                input.value = '';
-                this.renderChat();
-
-                // Имитация ответа ИИ с анимацией "Печатает..."
-                if (this.currentChat === 'ai') {
-                    const indicator = document.getElementById('aiTypingIndicator');
-                    indicator.classList.remove('hidden-force');
-                    this.scrollToBottom();
-
-                    setTimeout(() => {
-                        indicator.classList.add('hidden-force');
-                        Store.chat['ai'].push({
-                            id: Date.now()+1, sender: 'Vision AI', 
-                            text: `Анализ запроса: "${text}". Запускаю протокол сбора информации по базам...`, 
-                            time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }), 
-                            type: 'ai'
-                        });
-                        if (this.currentChat === 'ai') this.renderChat();
-                    }, 2000);
-                }
-            },
-
-            // --- МОДУЛЬ ПРОФИЛЯ ---
-            uploadAvatar(event) {
-                const file = event.target.files[0];
-                if (file) {
-                    const reader = new FileReader();
-                    reader.onload = (e) => {
-                        Store.user.avatar = e.target.result;
-                        document.getElementById('avatarPreview').innerHTML = `<img src="${Store.user.avatar}" class="w-full h-full object-cover">`;
-                        this.showToast('Фото загружено');
-                    };
-                    reader.readAsDataURL(file);
-                }
-            },
-
-            copyUserId() {
-                navigator.clipboard.writeText(Store.user.id);
-                this.showToast('ID Скопирован в буфер!');
-            },
-
-            saveProfile() {
-                const input = document.getElementById('userNameInput').value.trim();
-                Store.user.name = input.replace(/[^\w\s-а-яА-ЯёЁa-zA-Z0-9]/g, '') || 'Без имени';
-                Store.saveUser();
-                document.getElementById('userNameInput').value = Store.user.name;
-                this.showToast('Профиль сохранен');
-            },
-
-            // --- UI УТИЛИТЫ ---
-            showToast(msg) {
-                const toast = document.getElementById('toast');
-                document.getElementById('toastMsg').innerText = msg;
-                toast.classList.add('show');
-                setTimeout(() => toast.classList.remove('show'), 2500);
+                this.init();
             }
-        };
 
-        // Запуск
-        document.addEventListener('DOMContentLoaded', () => App.init());
+            init() {
+                // Восстановление настроек
+                document.getElementById('setting_server_ip').value = this.apiUrl;
+                document.getElementById('setting_api_key').value = this.apiKey;
+
+                // Слушатель формы
+                this.elements.form.addEventListener('submit', (e) => this.handleScan(e));
+
+                // Проверка здоровья сервера
+                this.checkServerHealth();
+            }
+
+            async checkServerHealth() {
+                try {
+                    const response = await fetch(`${this.apiUrl}/api/v1/status`);
+                    if (response.ok) {
+                        this.updateStatus(true, "Сервер ОНЛАЙН");
+                    } else {
+                        this.updateStatus(false, "Ошибка авторизации");
+                    }
+                } catch (e) {
+                    this.updateStatus(false, "Сервер ОФФЛАЙН");
+                }
+            }
+
+            updateStatus(isOnline, text) {
+                const color = isOnline ? 'bg-green-500 shadow-[0_0_8px_#10B981]' : 'bg-red-500 shadow-[0_0_8px_#EF4444]';
+                this.elements.statusDots.forEach(dot => {
+                    if(dot) dot.className = `w-3 h-3 rounded-full ${color}`;
+                });
+                if(this.elements.statusText) this.elements.statusText.innerText = text;
+            }
+
+            collectFormData() {
+                // Сбор площадок
+                const platforms = Array.from(document.querySelectorAll('input[name="platforms"]:checked')).map(cb => cb.value);
+                
+                // Формирование JSON под Pydantic модель backend'а
+                return {
+                    target: document.getElementById('target_query').value,
+                    region: document.getElementById('target_region').value,
+                    platforms: platforms.length > 0 ? platforms : ["avito"], // Фоллбэк
+                    min_price: parseFloat(document.getElementById('min_price').value) || null,
+                    max_price: parseFloat(document.getElementById('max_price').value) || null,
+                    strict_filters: {
+                        exact_model: document.getElementById('strict_model').value || null,
+                        condition: document.getElementById('strict_condition').value || null,
+                        no_accidents: document.getElementById('strict_no_accidents').checked,
+                        year_from: parseInt(document.getElementById('strict_year_from').value) || null,
+                        extra_props: {
+                            max_owners: parseInt(document.getElementById('strict_owners').value) || null,
+                            check_scam: document.getElementById('strict_check_scam').checked,
+                            seller_type: document.getElementById('strict_seller').value
+                        }
+                    }
+                };
+            }
+
+            async handleScan(e) {
+                e.preventDefault();
+                
+                // UI: Загрузка
+                this.elements.btnText.classList.add('hidden');
+                this.elements.btnLoader.classList.remove('hidden');
+                this.elements.scanFx.classList.remove('hidden');
+                this.elements.resultsContainer.classList.add('hidden');
+
+                const requestData = this.collectFormData();
+                console.log("[OmniScan] Отправка payload:", requestData);
+
+                try {
+                    // Пытаемся отправить реальный запрос на бэкенд
+                    const response = await fetch(`${this.apiUrl}/api/v1/scan`, {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'X-API-KEY': this.apiKey
+                        },
+                        body: JSON.stringify(requestData)
+                    });
+
+                    if (!response.ok) {
+                        throw new Error(`HTTP error! status: ${response.status}`);
+                    }
+
+                    const data = await response.json();
+                    
+                    // Бэкенд у нас асинхронный (в фоне), поэтому для демонстрации UI
+                    // мы сгенерируем Моковые данные на основе фильтров пользователя
+                    setTimeout(() => this.renderMockResults(requestData), 1500);
+
+                } catch (error) {
+                    console.error("[OmniScan] Ошибка API:", error);
+                    alert("Бэкенд недоступен или неверный API ключ. Запускаю демо-рендер для проверки UI.");
+                    
+                    // Фоллбэк: показываем, как работал бы интерфейс, даже если бэкенда нет
+                    setTimeout(() => this.renderMockResults(requestData), 1000);
+                } finally {
+                    setTimeout(() => {
+                        this.elements.btnText.classList.remove('hidden');
+                        this.elements.btnLoader.classList.add('hidden');
+                        this.elements.scanFx.classList.add('hidden');
+                    }, 1500);
+                }
+            }
+
+            renderMockResults(filters) {
+                // Это генератор мок-данных исключительно для визуала. 
+                // В проде сюда будет прилетать массив JSON из базы.
+                
+                let html = '';
+                const itemsCount = Math.floor(Math.random() * 5) + 3; // 3-7 элементов
+                
+                // Статистика
+                this.elements.statFiltered.innerText = Math.floor(Math.random() * 150) + 20; // Отсеяно мусора
+                this.elements.statPassed.innerText = itemsCount;
+
+                for(let i = 0; i < itemsCount; i++) {
+                    const isPereKup = filters.strict_filters.extra_props.seller_type === 'private' ? false : (Math.random() > 0.7);
+                    const price = filters.min_price ? filters.min_price + (Math.random() * 5000) : Math.floor(Math.random() * 50000) + 5000;
+                    
+                    html += `
+                    <div class="glass-panel rounded-xl overflow-hidden border border-omni-border hover:border-blue-500/50 transition-all transform hover:-translate-y-1">
+                        <!-- Изображение -->
+                        <div class="h-40 bg-omni-bg relative border-b border-omni-border flex items-center justify-center">
+                            <svg class="w-12 h-12 text-gray-700" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z"></path></svg>
+                            
+                            <!-- Бейджики -->
+                            <div class="absolute top-2 left-2 flex flex-col gap-1">
+                                <span class="bg-blue-600 text-white text-[10px] font-bold px-2 py-1 rounded shadow">${filters.platforms[0].toUpperCase()}</span>
+                                ${filters.strict_filters.condition === 'new' ? '<span class="bg-green-600 text-white text-[10px] font-bold px-2 py-1 rounded shadow">НОВЫЙ</span>' : ''}
+                            </div>
+                            
+                            <!-- Метка перекупа -->
+                            ${isPereKup ? '<div class="absolute bottom-2 right-2 bg-red-600/90 backdrop-blur text-white text-[10px] font-bold px-2 py-1 rounded shadow border border-red-400">⚠️ ВОЗМОЖНО ПЕРЕКУП</div>' : '<div class="absolute bottom-2 right-2 bg-green-600/90 backdrop-blur text-white text-[10px] font-bold px-2 py-1 rounded shadow border border-green-400">✅ ЧАСТНИК</div>'}
+                        </div>
+                        
+                        <!-- Информация -->
+                        <div class="p-4">
+                            <h4 class="text-white font-bold text-lg mb-1 truncate" title="${filters.target}">${filters.target} ${filters.strict_filters.exact_model || ''}</h4>
+                            <div class="text-blue-400 font-mono text-xl font-bold mb-3">${Math.floor(price).toLocaleString('ru-RU')} ₽</div>
+                            
+                            <div class="text-xs text-gray-400 space-y-1 mb-4 font-mono">
+                                <div>Регион: <span class="text-gray-200">${filters.region}</span></div>
+                                <div>Парсинг: <span class="text-green-400">ПРОШЕЛ STRICT ФИЛЬТР</span></div>
+                            </div>
+                            
+                            <!-- Кнопки действия -->
+                            <div class="flex gap-2">
+                                <button class="flex-1 bg-omni-bg border border-omni-border hover:bg-gray-800 text-white text-xs font-bold py-2 rounded-lg transition-colors">
+                                    Открыть
+                                </button>
+                                <button class="flex-[2] bg-gradient-to-r from-amber-600 to-amber-500 hover:from-amber-500 hover:to-amber-400 text-black text-xs font-black py-2 rounded-lg transition-colors flex items-center justify-center" onclick="alert('iVizion PRO требуется для глубокого анализа продавца')">
+                                    <svg class="w-4 h-4 mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path></svg>
+                                    iVizion Анализ
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                    `;
+                }
+
+                this.elements.resultsGrid.innerHTML = html;
+                this.elements.resultsContainer.classList.remove('hidden');
+                
+                // Плавный скролл к результатам
+                this.elements.resultsContainer.scrollIntoView({ behavior: 'smooth', block: 'start' });
+            }
+        }
+
+        // Инициализация при загрузке
+        const app = new OmniScanFrontend();
+
+        // Управление модалкой
+        function openSettings() {
+            const modal = document.getElementById('modal-settings');
+            const content = document.getElementById('modal-settings-content');
+            modal.classList.remove('hidden');
+            setTimeout(() => content.classList.remove('scale-95'), 10);
+        }
+
+        function closeSettings() {
+            const modal = document.getElementById('modal-settings');
+            const content = document.getElementById('modal-settings-content');
+            content.classList.add('scale-95');
+            setTimeout(() => modal.classList.add('hidden'), 200);
+        }
+
+        function saveSettings() {
+            const ip = document.getElementById('setting_server_ip').value;
+            const key = document.getElementById('setting_api_key').value;
+            
+            localStorage.setItem('omniscan_server', ip);
+            localStorage.setItem('omniscan_key', key);
+            
+            app.apiUrl = ip;
+            app.apiKey = key;
+            app.checkServerHealth();
+            
+            closeSettings();
+            alert("Настройки сохранены локально на устройстве.");
+        }
     </script>
 </body>
 </html>
