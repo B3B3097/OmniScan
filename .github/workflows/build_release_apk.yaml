@@ -1,0 +1,140 @@
+name: Build & Release OmniScan APK
+
+# Запускается вручную через вкладку Actions, либо при пуше тегов "v*"
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Версия релиза (например: 1.0.0)'
+        required: true
+        default: '1.0.0'
+  push:
+    tags:
+      - 'v*'
+
+# Выдаем права боту на создание релизов и загрузку файлов
+permissions:
+  contents: write
+
+jobs:
+  build-and-release-apk:
+    name: Build Android APK & Publish Release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js (Для сборки веб-контейнера)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Setup Java JDK (Для Android SDK)
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Install ImageMagick
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y imagemagick
+
+      - name: Initialize Capacitor Wrapper
+        run: |
+          echo "=== Настройка Capacitor CLI ==="
+          # Инициализируем package.json, если его нет
+          if [ ! -f package.json ]; then
+            npm init -y
+          fi
+          
+          # Устанавливаем ядро Capacitor для оборачивания HTML/JS в APK
+          npm install @capacitor/core @capacitor/cli @capacitor/android
+          
+          # Инициализируем проект. Указываем папку frontend, где лежит наш index.html
+          npx cap init OmniScan com.marketvision.omniscan --web-dir frontend
+          
+          # Добавляем платформу Android
+          npx cap add android
+          
+          # Синхронизируем веб-ассеты (index.html) с Android-проектом
+          npx cap sync android
+
+      - name: Inject Custom App Icon (Screenshot_20260816-031517.jpg)
+        run: |
+          echo "=== Обработка изображения обложки ==="
+          # Ищем файл, который вы прислали
+          IMAGE="Screenshot_20260816-031517.jpg"
+          
+          if [ -f "$IMAGE" ]; then
+            echo "Найдена обложка: $IMAGE. Конвертируем в системные иконки Android..."
+            RES_DIR="android/app/src/main/res"
+            
+            # Масштабируем изображение под все форматы экранов Android (от mdpi до xxxhdpi)
+            convert "$IMAGE" -resize 48x48! "$RES_DIR/mipmap-mdpi/ic_launcher.png"
+            convert "$IMAGE" -resize 48x48! "$RES_DIR/mipmap-mdpi/ic_launcher_round.png"
+            convert "$IMAGE" -resize 48x48! "$RES_DIR/mipmap-mdpi/ic_launcher_foreground.png"
+            
+            convert "$IMAGE" -resize 72x72! "$RES_DIR/mipmap-hdpi/ic_launcher.png"
+            convert "$IMAGE" -resize 72x72! "$RES_DIR/mipmap-hdpi/ic_launcher_round.png"
+            convert "$IMAGE" -resize 72x72! "$RES_DIR/mipmap-hdpi/ic_launcher_foreground.png"
+            
+            convert "$IMAGE" -resize 96x96! "$RES_DIR/mipmap-xhdpi/ic_launcher.png"
+            convert "$IMAGE" -resize 96x96! "$RES_DIR/mipmap-xhdpi/ic_launcher_round.png"
+            convert "$IMAGE" -resize 96x96! "$RES_DIR/mipmap-xhdpi/ic_launcher_foreground.png"
+            
+            convert "$IMAGE" -resize 144x144! "$RES_DIR/mipmap-xxhdpi/ic_launcher.png"
+            convert "$IMAGE" -resize 144x144! "$RES_DIR/mipmap-xxhdpi/ic_launcher_round.png"
+            convert "$IMAGE" -resize 144x144! "$RES_DIR/mipmap-xxhdpi/ic_launcher_foreground.png"
+            
+            convert "$IMAGE" -resize 192x192! "$RES_DIR/mipmap-xxxhdpi/ic_launcher.png"
+            convert "$IMAGE" -resize 192x192! "$RES_DIR/mipmap-xxxhdpi/ic_launcher_round.png"
+            convert "$IMAGE" -resize 192x192! "$RES_DIR/mipmap-xxxhdpi/ic_launcher_foreground.png"
+            
+            echo "✅ Неоновая иконка радара успешно установлена как логотип приложения!"
+          else
+            echo "⚠️ ВНИМАНИЕ: Файл $IMAGE не найден в корне репозитория. Используется стандартная иконка."
+            echo "Пожалуйста, загрузите $IMAGE в репозиторий, чтобы обложка применилась."
+          fi
+
+      - name: Build Android APK
+        run: |
+          echo "=== Компиляция APK файла через Gradle ==="
+          cd android
+          chmod +x gradlew
+          
+          # Собираем Debug версию. Она не требует сложных ключей подписи (keystore) 
+          # и устанавливается на любой Android телефон для тестирования.
+          ./gradlew assembleDebug
+
+      - name: Extract and Rename APK
+        run: |
+          echo "=== Подготовка артефакта к публикации ==="
+          # Достаем собранный файл из недр Android-проекта
+          VERSION="${{ github.event.inputs.version || '1.0.0' }}"
+          cp android/app/build/outputs/apk/debug/app-debug.apk OmniScan_v${VERSION}.apk
+          echo "APK скопирован: OmniScan_v${VERSION}.apk"
+
+      - name: Publish to GitHub Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ github.event.inputs.version || '1.0.0' }}-${{ github.run_number }}
+          name: "OmniScan OSINT Tracker v${{ github.event.inputs.version || '1.0.0' }}"
+          body: |
+            🚀 **Новый релиз трекера OmniScan успешно собран!**
+            
+            📦 **Что внутри сборки:**
+            - **Движок iVizion**: Интегрирован модуль визуальной проверки.
+            - **Strict Mode**: Полный алгоритм жестких фильтров и трекинга.
+            - **UI / UX**: Вшиты все 5 навигационных вкладок.
+            - **Кастомный дизайн**: В качестве иконки приложения установлен радар (`Screenshot_20260816-031517.jpg`).
+            
+            📥 **Как установить:**
+            1. Скачайте файл `OmniScan_v*.apk` из списка ассетов ниже на ваш Android.
+            2. Разрешите установку из неизвестных источников.
+            3. Запустите трекер.
+          files: |
+            OmniScan_v*.apk
+          draft: false
+          prerelease: false
