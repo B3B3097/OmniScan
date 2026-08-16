@@ -1,18 +1,28 @@
-name: Ultimate Android Build (CI/CD)
+юname: Ultimate Android Build (CI/CD)
 
 on:
-  push:
-    branches: [ main, master ]
-    tags: [ 'v*.*.*' ] # Запуск при создании тега (например, v1.0.0)
-  pull_request:
-    branches: [ main, master ]
+  # 1. РУЧНОЙ ЗАПУСК С ПАРАМЕТРАМИ
   workflow_dispatch:
     inputs:
+      build_type:
+        description: 'Какую версию собрать?'
+        required: true
+        type: choice
+        options:
+          - 'Debug & Release'
+          - 'Только Debug (быстрее)'
+        default: 'Debug & Release'
       create_release:
-        description: 'Создать GitHub Release?'
+        description: 'Опубликовать APK в GitHub Releases?'
         required: true
         type: boolean
-        default: false
+        default: true
+
+  # 2. Автоматический запуск (по желанию, можно удалить этот блок, если хочешь ТОЛЬКО вручную)
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -23,7 +33,6 @@ jobs:
     name: Build & Release Android APK
     runs-on: ubuntu-latest
     
-    # Права, необходимые для автоматического создания GitHub Release
     permissions:
       contents: write
 
@@ -56,7 +65,6 @@ jobs:
           echo "=== Установка зависимостей и сборка веб-проекта ==="
           if [ -f "package.json" ]; then
             npm install
-            # Если в package.json есть скрипт build, он будет выполнен (создаст папку dist/build)
             npm run build --if-present
           else
             echo "package.json не найден. Пропуск шага NPM сборки."
@@ -66,16 +74,13 @@ jobs:
         run: |
           mkdir -p www_dist
           
-          # Умный поиск скомпилированных файлов
           if [ -d "dist" ]; then cp -r dist/* www_dist/
           elif [ -d "build" ]; then cp -r build/* www_dist/
           elif [ -d "www" ]; then cp -r www/* www_dist/
           else
-            echo "Используем корень репозитория как веб-директорию"
             rsync -av --exclude='.git' --exclude='.github' --exclude='node_modules' --exclude='android' --exclude='www_dist' ./ www_dist/
           fi
 
-          # Инициализация Capacitor, если его нет
           if [ ! -f "capacitor.config.json" ] && [ ! -f "capacitor.config.ts" ]; then
             npm install @capacitor/core@latest @capacitor/cli@latest @capacitor/android@latest
             cat << 'EOF' > capacitor.config.json
@@ -95,23 +100,19 @@ EOF
       - name: 8. Generate App Icons & Splash Screens (if assets exist)
         run: |
           if [ -d "assets" ] && [ -f "assets/icon.png" ]; then
-            echo "Генерация иконок..."
             npm install -g @capacitor/assets
             npx capacitor-assets generate --android
           fi
 
       - name: 9. Set Dynamic Version Code & Permissions
         run: |
-          # Установка динамического versionCode на основе номера сборки GitHub Action
           BUILD_NUM=${{ github.run_number }}
           GRADLE_FILE="android/app/build.gradle"
           
           if [ -f "$GRADLE_FILE" ]; then
             sed -i "s/versionCode [0-9]*/versionCode $BUILD_NUM/g" "$GRADLE_FILE"
-            echo "versionCode обновлен до $BUILD_NUM"
           fi
 
-          # Добавление сетевых разрешений (если их нет)
           MANIFEST="android/app/src/main/AndroidManifest.xml"
           if [ -f "$MANIFEST" ]; then
             if ! grep -q "android.permission.INTERNET" "$MANIFEST"; then
@@ -135,10 +136,11 @@ EOF
           chmod +x ./gradlew
           ./gradlew assembleDebug --stacktrace --no-daemon
 
-      - name: 12. Build Release APK & Sign (Auto-Keystore)
+      - name: 12. Build Release APK & Sign
+        # Этот шаг пропустится, если при ручном запуске выбрано "Только Debug"
+        if: ${{ github.event.inputs.build_type == 'Debug & Release' || github.event_name != 'workflow_dispatch' }}
         run: |
           cd android
-          # Генерация временного ключа для подписи (в реальном проекте используйте GitHub Secrets)
           keytool -genkeypair -v -keystore release.keystore -alias vibe_alias -keyalg RSA -keysize 2048 -validity 10000 -storepass vibe_password123 -keypass vibe_password123 -dname "CN=VibeApp, OU=App, O=Vibe, C=US"
           
           ./gradlew assembleRelease --stacktrace --no-daemon
@@ -157,12 +159,13 @@ EOF
             android/app/build/outputs/apk/release/VibeApp-Release.apk
           retention-days: 14
 
-      - name: 14. Auto-Create GitHub Release (If tagged or requested)
+      - name: 14. Auto-Create GitHub Release
         uses: softprops/action-gh-release@v2
-        if: startsWith(github.ref, 'refs/tags/') || github.event.inputs.create_release == 'true'
+        # Создаст релиз, если стоит галочка при ручном запуске
+        if: ${{ github.event.inputs.create_release == 'true' }}
         with:
-          name: Release ${{ github.ref_name }} (Build ${{ github.run_number }})
-          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('v1.0.{0}', github.run_number) }}
+          name: Release Build ${{ github.run_number }}
+          tag_name: format('v1.0.{0}', github.run_number)
           files: |
             android/app/build/outputs/apk/release/VibeApp-Release.apk
             android/app/build/outputs/apk/debug/app-debug.apk
