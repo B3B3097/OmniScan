@@ -1,20 +1,31 @@
-name: Build Android APK from Web
+name: Ultimate Android Build (CI/CD)
 
 on:
   push:
     branches: [ main, master ]
+    tags: [ 'v*.*.*' ] # Запуск при создании тега (например, v1.0.0)
   pull_request:
     branches: [ main, master ]
   workflow_dispatch:
+    inputs:
+      create_release:
+        description: 'Создать GitHub Release?'
+        required: true
+        type: boolean
+        default: false
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  build-android:
-    name: Build Android APK (Debug & Release)
+  build-and-release:
+    name: Build & Release Android APK
     runs-on: ubuntu-latest
+    
+    # Права, необходимые для автоматического создания GitHub Release
+    permissions:
+      contents: write
 
     steps:
       - name: 1. Checkout Source Code
@@ -27,7 +38,6 @@ jobs:
         with:
           node-version: 20
           cache: 'npm'
-          cache-dependency-path: '**/package-lock.json'
 
       - name: 3. Setup Java JDK 17 (Temurin)
         uses: actions/setup-java@v4
@@ -38,98 +48,78 @@ jobs:
       - name: 4. Setup Android SDK Command-Line Tools
         uses: android-actions/setup-android@v3
 
-      - name: 5. Accept Android SDK Licenses & Install Components
-        run: |
-          yes | sdkmanager --licenses || true
-          sdkmanager "platforms;android-34" "build-tools;34.0.0"
+      - name: 5. Accept Android SDK Licenses
+        run: yes | sdkmanager --licenses || true
 
-      - name: 6. Prepare Web Assets & Capacitor Environment
+      - name: 6. Smart Web Build (NPM / Vite / React / Vue)
         run: |
-          echo "=== Подготовка структуры веб-проекта ==="
+          echo "=== Установка зависимостей и сборка веб-проекта ==="
+          if [ -f "package.json" ]; then
+            npm install
+            # Если в package.json есть скрипт build, он будет выполнен (создаст папку dist/build)
+            npm run build --if-present
+          else
+            echo "package.json не найден. Пропуск шага NPM сборки."
+          fi
+
+      - name: 7. Prepare Web Assets & Capacitor
+        run: |
           mkdir -p www_dist
           
-          # Проверка наличия исходных файлов, создание дефолтного index.html при отсутствии
-          if [ ! -f "index.html" ] && [ ! -d "www" ] && [ ! -d "dist" ] && [ ! -d "public" ]; then
-            echo "Файлы не найдены. Создаем заглушку index.html..."
-            cat << 'EOF' > index.html
-            <!DOCTYPE html>
-            <html lang="ru">
-            <head>
-              <meta charset="UTF-8">
-              <meta name="viewport" content="width=device-width, initial-scale=1.0">
-              <title>Vibe App</title>
-              <style>
-                body { margin: 0; font-family: system-ui, sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; background: #0f172a; color: #f8fafc; text-align: center; }
-                h1 { color: #38bdf8; }
-              </style>
-            </head>
-            <body>
-              <div>
-                <h1>Vibe App</h1>
-                <p>Приложение успешно собрано через GitHub Actions!</p>
-              </div>
-            </body>
-            </html>
-          EOF
-          fi
-
-          # Копирование веб-файлов во временную директорию
-          if [ -d "dist" ]; then
-            echo "Обнаружена папка dist. Копируем..."
-            cp -r dist/* www_dist/
-          elif [ -d "www" ]; then
-            echo "Обнаружена папка www. Копируем..."
-            cp -r www/* www_dist/
+          # Умный поиск скомпилированных файлов
+          if [ -d "dist" ]; then cp -r dist/* www_dist/
+          elif [ -d "build" ]; then cp -r build/* www_dist/
+          elif [ -d "www" ]; then cp -r www/* www_dist/
           else
-            echo "Копируем файлы из корня репозитория..."
-            rsync -av --exclude='.git' \
-                      --exclude='.github' \
-                      --exclude='node_modules' \
-                      --exclude='android' \
-                      --exclude='www_dist' \
-                      --exclude='*.yaml' \
-                      --exclude='*.yml' \
-                      ./ www_dist/
+            echo "Используем корень репозитория как веб-директорию"
+            rsync -av --exclude='.git' --exclude='.github' --exclude='node_modules' --exclude='android' --exclude='www_dist' ./ www_dist/
           fi
 
-          # Инициализация и настройка Capacitor
-          echo "=== Установка зависимостей Capacitor ==="
-          if [ ! -f "package.json" ]; then
-            npm init -y
-          fi
-          
-          npm install @capacitor/core@latest @capacitor/cli@latest @capacitor/android@latest
-          
-          # Создание конфигурации Capacitor
-          cat << 'EOF' > capacitor.config.json
-          {
-            "appId": "com.vibe.app",
-            "appName": "VibeApp",
-            "webDir": "www_dist",
-            "bundledWebRuntime": false,
-            "server": {
-              "cleartext": true,
-              "androidScheme": "https"
-            },
-            "android": {
-              "allowMixedContent": true
+          # Инициализация Capacitor, если его нет
+          if [ ! -f "capacitor.config.json" ] && [ ! -f "capacitor.config.ts" ]; then
+            npm install @capacitor/core@latest @capacitor/cli@latest @capacitor/android@latest
+            cat << 'EOF' > capacitor.config.json
+            {
+              "appId": "com.vibe.app",
+              "appName": "VibeApp",
+              "webDir": "www_dist",
+              "bundledWebRuntime": false,
+              "server": { "cleartext": true, "androidScheme": "https" }
             }
-          }
-          EOF
+EOF
+          fi
 
-          # Генерация Android платформы
-          npx cap add android || true
+          npx cap add android || echo "Платформа android уже существует"
           npx cap sync android
 
-      - name: 7. Configure Android Manifest Permissions
+      - name: 8. Generate App Icons & Splash Screens (if assets exist)
         run: |
-          MANIFEST="android/app/src/main/AndroidManifest.xml"
-          if [ -f "$MANIFEST" ]; then
-            echo "Настройка разрешений AndroidManifest.xml..."
-            sed -i '/<application/i \    <uses-permission android:name="android.permission.INTERNET" />\n    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />' "$MANIFEST"
+          if [ -d "assets" ] && [ -f "assets/icon.png" ]; then
+            echo "Генерация иконок..."
+            npm install -g @capacitor/assets
+            npx capacitor-assets generate --android
           fi
 
-      - name: 8. Setup Gradle Cache
+      - name: 9. Set Dynamic Version Code & Permissions
+        run: |
+          # Установка динамического versionCode на основе номера сборки GitHub Action
+          BUILD_NUM=${{ github.run_number }}
+          GRADLE_FILE="android/app/build.gradle"
+          
+          if [ -f "$GRADLE_FILE" ]; then
+            sed -i "s/versionCode [0-9]*/versionCode $BUILD_NUM/g" "$GRADLE_FILE"
+            echo "versionCode обновлен до $BUILD_NUM"
+          fi
+
+          # Добавление сетевых разрешений (если их нет)
+          MANIFEST="android/app/src/main/AndroidManifest.xml"
+          if [ -f "$MANIFEST" ]; then
+            if ! grep -q "android.permission.INTERNET" "$MANIFEST"; then
+              sed -i '/<application/i \    <uses-permission android:name="android.permission.INTERNET" />' "$MANIFEST"
+            fi
+          fi
+
+      - name: 10. Setup Gradle Cache
         uses: actions/cache@v4
         with:
           path: |
@@ -139,39 +129,41 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-gradle-
 
-      - name: 9. Build Debug APK
+      - name: 11. Build Debug APK
         run: |
           cd android
           chmod +x ./gradlew
           ./gradlew assembleDebug --stacktrace --no-daemon
 
-      - name: 10. Generate Keystore & Build Release APK
+      - name: 12. Build Release APK & Sign (Auto-Keystore)
         run: |
           cd android
-          
-          echo "Генерация релизного ключа..."
-          keytool -genkeypair -v -keystore release.keystore -alias vibe_alias -keyalg RSA -keysize 2048 -validity 10000 -storepass vibe_password123 -keypass vibe_password123 -dname "CN=VibeApp, OU=App, O=Vibe, L=City, S=State, C=US"
+          # Генерация временного ключа для подписи (в реальном проекте используйте GitHub Secrets)
+          keytool -genkeypair -v -keystore release.keystore -alias vibe_alias -keyalg RSA -keysize 2048 -validity 10000 -storepass vibe_password123 -keypass vibe_password123 -dname "CN=VibeApp, OU=App, O=Vibe, C=US"
           
           ./gradlew assembleRelease --stacktrace --no-daemon
           
-          # Подпись Release APK
           cd app/build/outputs/apk/release/
-          BUILD_TOOLS_DIR=$(ls -d /usr/local/lib/android/sdk/build-tools/* | tail -n 1)
-          $BUILD_TOOLS_DIR/zipalign -v -p 4 app-release-unsigned.apk app-release-aligned.apk || cp app-release-unsigned.apk app-release-aligned.apk
-          $BUILD_TOOLS_DIR/apksigner sign --ks ../../../../../release.keystore --ks-key-alias vibe_alias --ks-pass pass:vibe_password123 --key-pass pass:vibe_password123 --out app-release-signed.apk app-release-aligned.apk || true
+          BUILD_TOOLS_DIR=$(ls -d /usr/local/lib/android/sdk/build-tools/* | sort -V | tail -n 1)
+          $BUILD_TOOLS_DIR/zipalign -v -p 4 app-release-unsigned.apk VibeApp-Release.apk || cp app-release-unsigned.apk VibeApp-Release.apk
+          $BUILD_TOOLS_DIR/apksigner sign --ks ../../../../../release.keystore --ks-key-alias vibe_alias --ks-pass pass:vibe_password123 --key-pass pass:vibe_password123 VibeApp-Release.apk
 
-      - name: 11. Upload Debug APK Artifact
+      - name: 13. Upload Artifacts (Action Page)
         uses: actions/upload-artifact@v4
         with:
-          name: app-debug-apk
-          path: android/app/build/outputs/apk/debug/*.apk
-          retention-days: 14
-
-      - name: 12. Upload Release APK Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: app-release-apk
+          name: VibeApp-APKs
           path: |
-            android/app/build/outputs/apk/release/*signed.apk
-            android/app/build/outputs/apk/release/*.apk
+            android/app/build/outputs/apk/debug/*.apk
+            android/app/build/outputs/apk/release/VibeApp-Release.apk
           retention-days: 14
+
+      - name: 14. Auto-Create GitHub Release (If tagged or requested)
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/') || github.event.inputs.create_release == 'true'
+        with:
+          name: Release ${{ github.ref_name }} (Build ${{ github.run_number }})
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('v1.0.{0}', github.run_number) }}
+          files: |
+            android/app/build/outputs/apk/release/VibeApp-Release.apk
+            android/app/build/outputs/apk/debug/app-debug.apk
+          generate_release_notes: true
