@@ -22,18 +22,19 @@ jobs:
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: Check Gradle Wrapper & Permissions
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.5'
+
+      - name: Build APK with Gradle
         run: |
           if [ -f "./gradlew" ]; then
             chmod +x ./gradlew
+            ./gradlew assembleDebug --no-daemon --stacktrace
           else
-            echo "Gradle wrapper not found, initializing gradle..."
-            gradle wrapper
-            chmod +x ./gradlew
+            gradle assembleDebug --no-daemon --stacktrace
           fi
-
-      - name: Build APK
-        run: ./gradlew assembleDebug --no-daemon --stacktrace
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
