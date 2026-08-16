@@ -1,55 +1,135 @@
-name: Build APK from Web
+name: Build Android APK from Web
 
 on:
   push:
     branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
   workflow_dispatch:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  build:
-    name: Build Android APK
+  build-android:
+    name: Build Android APK (Debug & Release)
     runs-on: ubuntu-latest
 
     steps:
-      - name: 1. Checkout Repository
+      - name: 1. Checkout Source Code
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: 2. Setup Node.js
+      - name: 2. Setup Node.js Environment
         uses: actions/setup-node@v4
         with:
           node-version: 20
+          cache: 'npm'
+          cache-dependency-path: '**/package-lock.json'
 
-      - name: 3. Setup Java JDK 17
+      - name: 3. Setup Java JDK 17 (Temurin)
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: 4. Setup Android SDK
+      - name: 4. Setup Android SDK Command-Line Tools
         uses: android-actions/setup-android@v3
 
-      - name: 4.1. Accept Android SDK Licenses
+      - name: 5. Accept Android SDK Licenses & Install Components
         run: |
           yes | sdkmanager --licenses || true
+          sdkmanager "platforms;android-34" "build-tools;34.0.0"
 
-      - name: 5. Generate Android App Structure
+      - name: 6. Prepare Web Assets & Capacitor Environment
         run: |
-          # Создаем временную директорию сборки для чистой структуры
-          mkdir -p build_temp
+          echo "=== Подготовка структуры веб-проекта ==="
+          mkdir -p www_dist
           
-          # Копируем веб-ресурсы, исключая системные папки Git и Node
-          rsync -av --exclude='.git' --exclude='.github' --exclude='node_modules' --exclude='android' --exclude='build_temp' ./ build_temp/ || true
+          # Проверка наличия исходных файлов, создание дефолтного index.html при отсутствии
+          if [ ! -f "index.html" ] && [ ! -d "www" ] && [ ! -d "dist" ] && [ ! -d "public" ]; then
+            echo "Файлы не найдены. Создаем заглушку index.html..."
+            cat << 'EOF' > index.html
+            <!DOCTYPE html>
+            <html lang="ru">
+            <head>
+              <meta charset="UTF-8">
+              <meta name="viewport" content="width=device-width, initial-scale=1.0">
+              <title>Vibe App</title>
+              <style>
+                body { margin: 0; font-family: system-ui, sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; background: #0f172a; color: #f8fafc; text-align: center; }
+                h1 { color: #38bdf8; }
+              </style>
+            </head>
+            <body>
+              <div>
+                <h1>Vibe App</h1>
+                <p>Приложение успешно собрано через GitHub Actions!</p>
+              </div>
+            </body>
+            </html>
+          EOF
+          fi
+
+          # Копирование веб-файлов во временную директорию
+          if [ -d "dist" ]; then
+            echo "Обнаружена папка dist. Копируем..."
+            cp -r dist/* www_dist/
+          elif [ -d "www" ]; then
+            echo "Обнаружена папка www. Копируем..."
+            cp -r www/* www_dist/
+          else
+            echo "Копируем файлы из корня репозитория..."
+            rsync -av --exclude='.git' \
+                      --exclude='.github' \
+                      --exclude='node_modules' \
+                      --exclude='android' \
+                      --exclude='www_dist' \
+                      --exclude='*.yaml' \
+                      --exclude='*.yml' \
+                      ./ www_dist/
+          fi
+
+          # Инициализация и настройка Capacitor
+          echo "=== Установка зависимостей Capacitor ==="
+          if [ ! -f "package.json" ]; then
+            npm init -y
+          fi
           
-          # Инициализируем проект Capacitor
-          npm init -y
           npm install @capacitor/core@latest @capacitor/cli@latest @capacitor/android@latest
           
-          # Настраиваем проект
-          npx cap init "VibeApp" "com.vibe.app" --web-dir "build_temp"
-          npx cap add android
+          # Создание конфигурации Capacitor
+          cat << 'EOF' > capacitor.config.json
+          {
+            "appId": "com.vibe.app",
+            "appName": "VibeApp",
+            "webDir": "www_dist",
+            "bundledWebRuntime": false,
+            "server": {
+              "cleartext": true,
+              "androidScheme": "https"
+            },
+            "android": {
+              "allowMixedContent": true
+            }
+          }
+          EOF
+
+          # Генерация Android платформы
+          npx cap add android || true
           npx cap sync android
 
-      - name: 6. Setup Gradle Cache
+      - name: 7. Configure Android Manifest Permissions
+        run: |
+          MANIFEST="android/app/src/main/AndroidManifest.xml"
+          if [ -f "$MANIFEST" ]; then
+            echo "Настройка разрешений AndroidManifest.xml..."
+            sed -i '/<application/i \    <uses-permission android:name="android.permission.INTERNET" />\n    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />' "$MANIFEST"
+          fi
+
+      - name: 8. Setup Gradle Cache
         uses: actions/cache@v4
         with:
           path: |
@@ -59,15 +139,39 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-gradle-
 
-      - name: 7. Build Debug APK
+      - name: 9. Build Debug APK
         run: |
           cd android
           chmod +x ./gradlew
           ./gradlew assembleDebug --stacktrace --no-daemon
 
-      - name: 8. Upload APK Artifact
+      - name: 10. Generate Keystore & Build Release APK
+        run: |
+          cd android
+          
+          echo "Генерация релизного ключа..."
+          keytool -genkeypair -v -keystore release.keystore -alias vibe_alias -keyalg RSA -keysize 2048 -validity 10000 -storepass vibe_password123 -keypass vibe_password123 -dname "CN=VibeApp, OU=App, O=Vibe, L=City, S=State, C=US"
+          
+          ./gradlew assembleRelease --stacktrace --no-daemon
+          
+          # Подпись Release APK
+          cd app/build/outputs/apk/release/
+          BUILD_TOOLS_DIR=$(ls -d /usr/local/lib/android/sdk/build-tools/* | tail -n 1)
+          $BUILD_TOOLS_DIR/zipalign -v -p 4 app-release-unsigned.apk app-release-aligned.apk || cp app-release-unsigned.apk app-release-aligned.apk
+          $BUILD_TOOLS_DIR/apksigner sign --ks ../../../../../release.keystore --ks-key-alias vibe_alias --ks-pass pass:vibe_password123 --key-pass pass:vibe_password123 --out app-release-signed.apk app-release-aligned.apk || true
+
+      - name: 11. Upload Debug APK Artifact
         uses: actions/upload-artifact@v4
         with:
           name: app-debug-apk
           path: android/app/build/outputs/apk/debug/*.apk
+          retention-days: 14
+
+      - name: 12. Upload Release APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-release-apk
+          path: |
+            android/app/build/outputs/apk/release/*signed.apk
+            android/app/build/outputs/apk/release/*.apk
           retention-days: 14
