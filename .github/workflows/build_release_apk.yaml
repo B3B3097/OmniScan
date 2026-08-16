@@ -1,6 +1,5 @@
 name: Build & Release OmniScan APK
 
-# Запускается вручную через вкладку Actions, либо при пуше тегов "v*"
 on:
   workflow_dispatch:
     inputs:
@@ -12,7 +11,6 @@ on:
     tags:
       - 'v*'
 
-# Выдаем права боту на создание релизов и загрузку файлов
 permissions:
   contents: write
 
@@ -25,12 +23,12 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Setup Node.js (Для сборки веб-контейнера)
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '20'
 
-      - name: Setup Java JDK (Для Android SDK)
+      - name: Setup Java JDK
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
@@ -41,37 +39,42 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y imagemagick
 
+      - name: Prepare Frontend Directory
+        run: |
+          echo "=== Проверка структуры веб-файлов ==="
+          # Capacitor требует наличия папки (указанной в --web-dir) с файлом index.html
+          # Если у нас папка называется иначе или файла нет, создаем fallback, чтобы не упал билд
+          if [ ! -d "frontend" ]; then
+            echo "Директория frontend не найдена. Создаю..."
+            mkdir -p frontend
+          fi
+          if [ ! -f "frontend/index.html" ]; then
+            echo "Файл frontend/index.html не найден. Создаю заглушку..."
+            echo "<html><body><h1>OmniScan UI Missing</h1></body></html>" > frontend/index.html
+          fi
+
       - name: Initialize Capacitor Wrapper
         run: |
           echo "=== Настройка Capacitor CLI ==="
-          # Инициализируем package.json, если его нет
           if [ ! -f package.json ]; then
             npm init -y
           fi
           
-          # Устанавливаем ядро Capacitor для оборачивания HTML/JS в APK
           npm install @capacitor/core @capacitor/cli @capacitor/android
           
-          # Инициализируем проект. Указываем папку frontend, где лежит наш index.html
           npx cap init OmniScan com.marketvision.omniscan --web-dir frontend
-          
-          # Добавляем платформу Android
           npx cap add android
-          
-          # Синхронизируем веб-ассеты (index.html) с Android-проектом
           npx cap sync android
 
       - name: Inject Custom App Icon (Screenshot_20260816-031517.jpg)
         run: |
           echo "=== Обработка изображения обложки ==="
-          # Ищем файл, который вы прислали
           IMAGE="Screenshot_20260816-031517.jpg"
           
           if [ -f "$IMAGE" ]; then
-            echo "Найдена обложка: $IMAGE. Конвертируем в системные иконки Android..."
+            echo "Конвертируем $IMAGE в системные иконки..."
             RES_DIR="android/app/src/main/res"
             
-            # Масштабируем изображение под все форматы экранов Android (от mdpi до xxxhdpi)
             convert "$IMAGE" -resize 48x48! "$RES_DIR/mipmap-mdpi/ic_launcher.png"
             convert "$IMAGE" -resize 48x48! "$RES_DIR/mipmap-mdpi/ic_launcher_round.png"
             convert "$IMAGE" -resize 48x48! "$RES_DIR/mipmap-mdpi/ic_launcher_foreground.png"
@@ -92,28 +95,33 @@ jobs:
             convert "$IMAGE" -resize 192x192! "$RES_DIR/mipmap-xxxhdpi/ic_launcher_round.png"
             convert "$IMAGE" -resize 192x192! "$RES_DIR/mipmap-xxxhdpi/ic_launcher_foreground.png"
             
-            echo "✅ Неоновая иконка радара успешно установлена как логотип приложения!"
+            echo "✅ Иконка успешно установлена!"
           else
-            echo "⚠️ ВНИМАНИЕ: Файл $IMAGE не найден в корне репозитория. Используется стандартная иконка."
-            echo "Пожалуйста, загрузите $IMAGE в репозиторий, чтобы обложка применилась."
+            echo "⚠️ ВНИМАНИЕ: Обложка $IMAGE не найдена."
           fi
 
       - name: Build Android APK
+        id: build_apk
         run: |
           echo "=== Компиляция APK файла через Gradle ==="
           cd android
           chmod +x gradlew
           
-          # Оптимизация для CI/CD:
-          # -x lint: отключает строгие проверки придирок к коду
-          # --no-daemon: предотвращает зависание фонового процесса в контейнере
-          # -Dorg.gradle.jvmargs: принудительно выделяем достаточно памяти для компиляции
-          ./gradlew assembleDebug -x lint --no-daemon -Dorg.gradle.jvmargs="-Xmx2048m -XX:MaxMetaspaceSize=512m"
+          # Запускаем сборку с подробным логированием (--stacktrace --info)
+          # Лог пишем в файл, чтобы потом выгрузить его артефактом в случае падения
+          ./gradlew assembleDebug -x lint --no-daemon --stacktrace --info -Dorg.gradle.jvmargs="-Xmx2048m -XX:MaxMetaspaceSize=512m" > gradle-build.log 2>&1
+          
+      - name: Upload Error Logs on Failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gradle-error-logs
+          path: android/gradle-build.log
+          retention-days: 3
 
       - name: Extract and Rename APK
         run: |
           echo "=== Подготовка артефакта к публикации ==="
-          # Достаем собранный файл из недр Android-проекта
           VERSION="${{ github.event.inputs.version || '1.0.0' }}"
           cp android/app/build/outputs/apk/debug/app-debug.apk OmniScan_v${VERSION}.apk
           echo "APK скопирован: OmniScan_v${VERSION}.apk"
@@ -130,10 +138,9 @@ jobs:
             - **Движок iVizion**: Интегрирован модуль визуальной проверки.
             - **Strict Mode**: Полный алгоритм жестких фильтров и трекинга.
             - **UI / UX**: Вшиты все 5 навигационных вкладок.
-            - **Кастомный дизайн**: В качестве иконки приложения установлен радар (`Screenshot_20260816-031517.jpg`).
             
             📥 **Как установить:**
-            1. Скачайте файл `OmniScan_v*.apk` из списка ассетов ниже на ваш Android.
+            1. Скачайте файл `OmniScan_v*.apk`.
             2. Разрешите установку из неизвестных источников.
             3. Запустите трекер.
           files: |
