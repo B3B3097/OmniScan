@@ -28,28 +28,44 @@ jobs:
       - name: 4. Setup Android SDK
         uses: android-actions/setup-android@v3
 
+      - name: 4.1. Accept Android SDK Licenses
+        run: |
+          yes | sdkmanager --licenses || true
+
       - name: 5. Generate Android App Structure
         run: |
-          mkdir -p www
-          # Копируем сайт в папку ассетов
-          cp -r index.html www/ 2>/dev/null || true
-          find . -maxdepth 1 -not -name '.*' -not -name 'www' -not -name 'node_modules' -exec cp -r {} www/ \; || true
+          # Создаем временную директорию сборки для чистой структуры
+          mkdir -p build_temp
+          
+          # Копируем веб-ресурсы, исключая системные папки Git и Node
+          rsync -av --exclude='.git' --exclude='.github' --exclude='node_modules' --exclude='android' --exclude='build_temp' ./ build_temp/ || true
           
           # Инициализируем проект Capacitor
           npm init -y
           npm install @capacitor/core@latest @capacitor/cli@latest @capacitor/android@latest
           
-          npx cap init "VibeApp" "com.vibe.app" --web-dir "www"
+          # Настраиваем проект
+          npx cap init "VibeApp" "com.vibe.app" --web-dir "build_temp"
           npx cap add android
           npx cap sync android
 
-      - name: 6. Build Debug APK
+      - name: 6. Setup Gradle Cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('android/**/*.gradle*', 'android/**/gradle-wrapper.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+
+      - name: 7. Build Debug APK
         run: |
           cd android
           chmod +x ./gradlew
-          ./gradlew assembleDebug --stacktrace
+          ./gradlew assembleDebug --stacktrace --no-daemon
 
-      - name: 7. Upload APK Artifact
+      - name: 8. Upload APK Artifact
         uses: actions/upload-artifact@v4
         with:
           name: app-debug-apk
