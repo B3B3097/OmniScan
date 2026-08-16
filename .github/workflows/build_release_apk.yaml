@@ -1,4 +1,4 @@
-name: Build APK from Web App
+name: Build APK from Web
 
 on:
   push:
@@ -7,14 +7,14 @@ on:
 
 jobs:
   build:
-    name: Package Web to Android APK
+    name: Build Android APK
     runs-on: ubuntu-latest
 
     steps:
       - name: 1. Checkout Repository
         uses: actions/checkout@v4
 
-      - name: 2. Setup Node.js Environment
+      - name: 2. Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 20
@@ -28,16 +28,18 @@ jobs:
       - name: 4. Setup Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: 5. Prepare Web Assets & Capacitor
+      - name: 5. Generate Android App Structure
         run: |
           mkdir -p www
-          # Копируем всё содержимое репо в www (кроме папки .git и workflows)
-          rsync -av --exclude='.git' --exclude='.github' ./ www/ || cp -r index.html www/ 2>/dev/null || true
+          # Копируем сайт в папку ассетов
+          cp -r index.html www/ 2>/dev/null || true
+          find . -maxdepth 1 -not -name '.*' -not -name 'www' -not -name 'node_modules' -exec cp -r {} www/ \; || true
           
+          # Инициализируем проект Capacitor
           npm init -y
-          npm install @capacitor/core @capacitor/cli @capacitor/android
+          npm install @capacitor/core@latest @capacitor/cli@latest @capacitor/android@latest
           
-          npx cap init "MyApp" "com.app.webview" --web-dir "www"
+          npx cap init "VibeApp" "com.vibe.app" --web-dir "www"
           npx cap add android
           npx cap sync android
 
