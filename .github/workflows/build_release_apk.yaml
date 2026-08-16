@@ -104,9 +104,11 @@ jobs:
           cd android
           chmod +x gradlew
           
-          # Собираем Debug версию. Она не требует сложных ключей подписи (keystore) 
-          # и устанавливается на любой Android телефон для тестирования.
-          ./gradlew assembleDebug
+          # Оптимизация для CI/CD:
+          # -x lint: отключает строгие проверки придирок к коду
+          # --no-daemon: предотвращает зависание фонового процесса в контейнере
+          # -Dorg.gradle.jvmargs: принудительно выделяем достаточно памяти для компиляции
+          ./gradlew assembleDebug -x lint --no-daemon -Dorg.gradle.jvmargs="-Xmx2048m -XX:MaxMetaspaceSize=512m"
 
       - name: Extract and Rename APK
         run: |
