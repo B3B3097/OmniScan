@@ -1,7 +1,6 @@
-юname: Ultimate Android Build (CI/CD)
+name: Ultimate Android Build (CI/CD)
 
 on:
-  # 1. РУЧНОЙ ЗАПУСК С ПАРАМЕТРАМИ
   workflow_dispatch:
     inputs:
       build_type:
@@ -17,8 +16,6 @@ on:
         required: true
         type: boolean
         default: true
-
-  # 2. Автоматический запуск (по желанию, можно удалить этот блок, если хочешь ТОЛЬКО вручную)
   push:
     branches: [ main, master ]
   pull_request:
@@ -83,21 +80,20 @@ jobs:
 
           if [ ! -f "capacitor.config.json" ] && [ ! -f "capacitor.config.ts" ]; then
             npm install @capacitor/core@latest @capacitor/cli@latest @capacitor/android@latest
-            cat << 'EOF' > capacitor.config.json
-            {
-              "appId": "com.vibe.app",
-              "appName": "VibeApp",
+            # Используем безопасный echo вместо EOF, чтобы не ломать отступы YAML
+            echo '{
+              "appId": "com.omniscan.app",
+              "appName": "OmniScan",
               "webDir": "www_dist",
               "bundledWebRuntime": false,
               "server": { "cleartext": true, "androidScheme": "https" }
-            }
-EOF
+            }' > capacitor.config.json
           fi
 
           npx cap add android || echo "Платформа android уже существует"
           npx cap sync android
 
-      - name: 8. Generate App Icons & Splash Screens (if assets exist)
+      - name: 8. Generate App Icons & Splash Screens
         run: |
           if [ -d "assets" ] && [ -f "assets/icon.png" ]; then
             npm install -g @capacitor/assets
@@ -137,36 +133,34 @@ EOF
           ./gradlew assembleDebug --stacktrace --no-daemon
 
       - name: 12. Build Release APK & Sign
-        # Этот шаг пропустится, если при ручном запуске выбрано "Только Debug"
         if: ${{ github.event.inputs.build_type == 'Debug & Release' || github.event_name != 'workflow_dispatch' }}
         run: |
           cd android
-          keytool -genkeypair -v -keystore release.keystore -alias vibe_alias -keyalg RSA -keysize 2048 -validity 10000 -storepass vibe_password123 -keypass vibe_password123 -dname "CN=VibeApp, OU=App, O=Vibe, C=US"
+          keytool -genkeypair -v -keystore release.keystore -alias app_alias -keyalg RSA -keysize 2048 -validity 10000 -storepass password123 -keypass password123 -dname "CN=OmniScan, OU=App, O=OmniScan, C=US"
           
           ./gradlew assembleRelease --stacktrace --no-daemon
           
           cd app/build/outputs/apk/release/
           BUILD_TOOLS_DIR=$(ls -d /usr/local/lib/android/sdk/build-tools/* | sort -V | tail -n 1)
-          $BUILD_TOOLS_DIR/zipalign -v -p 4 app-release-unsigned.apk VibeApp-Release.apk || cp app-release-unsigned.apk VibeApp-Release.apk
-          $BUILD_TOOLS_DIR/apksigner sign --ks ../../../../../release.keystore --ks-key-alias vibe_alias --ks-pass pass:vibe_password123 --key-pass pass:vibe_password123 VibeApp-Release.apk
+          $BUILD_TOOLS_DIR/zipalign -v -p 4 app-release-unsigned.apk OmniScan-Release.apk || cp app-release-unsigned.apk OmniScan-Release.apk
+          $BUILD_TOOLS_DIR/apksigner sign --ks ../../../../../release.keystore --ks-key-alias app_alias --ks-pass pass:password123 --key-pass pass:password123 OmniScan-Release.apk
 
-      - name: 13. Upload Artifacts (Action Page)
+      - name: 13. Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: VibeApp-APKs
+          name: OmniScan-APKs
           path: |
             android/app/build/outputs/apk/debug/*.apk
-            android/app/build/outputs/apk/release/VibeApp-Release.apk
+            android/app/build/outputs/apk/release/*Release.apk
           retention-days: 14
 
       - name: 14. Auto-Create GitHub Release
         uses: softprops/action-gh-release@v2
-        # Создаст релиз, если стоит галочка при ручном запуске
-        if: ${{ github.event.inputs.create_release == 'true' }}
+        if: ${{ github.event.inputs.create_release == 'true' || github.event_name != 'workflow_dispatch' }}
         with:
           name: Release Build ${{ github.run_number }}
-          tag_name: format('v1.0.{0}', github.run_number)
+          tag_name: v1.0.${{ github.run_number }}
           files: |
-            android/app/build/outputs/apk/release/VibeApp-Release.apk
+            android/app/build/outputs/apk/release/OmniScan-Release.apk
             android/app/build/outputs/apk/debug/app-debug.apk
           generate_release_notes: true
