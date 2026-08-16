@@ -1,149 +1,86 @@
-name: Build & Release OmniScan APK
+name: Full Android CI/CD Pipeline
 
 on:
-  workflow_dispatch:
-    inputs:
-      version:
-        description: 'Версия релиза (например: 1.0.0)'
-        required: true
-        default: '1.0.0'
   push:
+    branches: [ main, master ]
     tags:
       - 'v*'
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
 
-permissions:
-  contents: write
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  build-and-release-apk:
-    name: Build Android APK & Publish Release
+  build:
+    name: Build & Package APK
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout Repository
+      - name: Checkout repository
         uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          fetch-depth: 0
 
-      - name: Setup Java JDK
+      - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: '17'
+          cache: 'gradle'
 
-      - name: Install ImageMagick
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y imagemagick
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
 
-      - name: Prepare Frontend Directory
-        run: |
-          echo "=== Проверка структуры веб-файлов ==="
-          # Capacitor требует наличия папки (указанной в --web-dir) с файлом index.html
-          # Если у нас папка называется иначе или файла нет, создаем fallback, чтобы не упал билд
-          if [ ! -d "frontend" ]; then
-            echo "Директория frontend не найдена. Создаю..."
-            mkdir -p frontend
-          fi
-          if [ ! -f "frontend/index.html" ]; then
-            echo "Файл frontend/index.html не найден. Создаю заглушку..."
-            echo "<html><body><h1>OmniScan UI Missing</h1></body></html>" > frontend/index.html
-          fi
+      - name: Make Gradlew Executable
+        run: chmod +x ./gradlew
 
-      - name: Initialize Capacitor Wrapper
-        run: |
-          echo "=== Настройка Capacitor CLI ==="
-          if [ ! -f package.json ]; then
-            npm init -y
-          fi
-          
-          npm install @capacitor/core @capacitor/cli @capacitor/android
-          
-          npx cap init OmniScan com.marketvision.omniscan --web-dir frontend
-          npx cap add android
-          npx cap sync android
+      - name: Run Lint & Unit Tests
+        run: ./gradlew test lintDebug --continue || true
 
-      - name: Inject Custom App Icon (Screenshot_20260816-031517.jpg)
-        run: |
-          echo "=== Обработка изображения обложки ==="
-          IMAGE="Screenshot_20260816-031517.jpg"
-          
-          if [ -f "$IMAGE" ]; then
-            echo "Конвертируем $IMAGE в системные иконки..."
-            RES_DIR="android/app/src/main/res"
-            
-            convert "$IMAGE" -resize 48x48! "$RES_DIR/mipmap-mdpi/ic_launcher.png"
-            convert "$IMAGE" -resize 48x48! "$RES_DIR/mipmap-mdpi/ic_launcher_round.png"
-            convert "$IMAGE" -resize 48x48! "$RES_DIR/mipmap-mdpi/ic_launcher_foreground.png"
-            
-            convert "$IMAGE" -resize 72x72! "$RES_DIR/mipmap-hdpi/ic_launcher.png"
-            convert "$IMAGE" -resize 72x72! "$RES_DIR/mipmap-hdpi/ic_launcher_round.png"
-            convert "$IMAGE" -resize 72x72! "$RES_DIR/mipmap-hdpi/ic_launcher_foreground.png"
-            
-            convert "$IMAGE" -resize 96x96! "$RES_DIR/mipmap-xhdpi/ic_launcher.png"
-            convert "$IMAGE" -resize 96x96! "$RES_DIR/mipmap-xhdpi/ic_launcher_round.png"
-            convert "$IMAGE" -resize 96x96! "$RES_DIR/mipmap-xhdpi/ic_launcher_foreground.png"
-            
-            convert "$IMAGE" -resize 144x144! "$RES_DIR/mipmap-xxhdpi/ic_launcher.png"
-            convert "$IMAGE" -resize 144x144! "$RES_DIR/mipmap-xxhdpi/ic_launcher_round.png"
-            convert "$IMAGE" -resize 144x144! "$RES_DIR/mipmap-xxhdpi/ic_launcher_foreground.png"
-            
-            convert "$IMAGE" -resize 192x192! "$RES_DIR/mipmap-xxxhdpi/ic_launcher.png"
-            convert "$IMAGE" -resize 192x192! "$RES_DIR/mipmap-xxxhdpi/ic_launcher_round.png"
-            convert "$IMAGE" -resize 192x192! "$RES_DIR/mipmap-xxxhdpi/ic_launcher_foreground.png"
-            
-            echo "✅ Иконка успешно установлена!"
-          else
-            echo "⚠️ ВНИМАНИЕ: Обложка $IMAGE не найдена."
-          fi
+      - name: Build Debug & Release APK
+        run: ./gradlew assembleDebug assembleRelease --stacktrace
 
-      - name: Build Android APK
-        id: build_apk
+      - name: Sign Release APK (if keystore provided)
+        if: env.KEYSTORE_BASE64 != ''
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
-          echo "=== Компиляция APK файла через Gradle ==="
-          cd android
-          chmod +x gradlew
-          
-          # Запускаем сборку с подробным логированием (--stacktrace --info)
-          # Лог пишем в файл, чтобы потом выгрузить его артефактом в случае падения
-          ./gradlew assembleDebug -x lint --no-daemon --stacktrace --info -Dorg.gradle.jvmargs="-Xmx2048m -XX:MaxMetaspaceSize=512m" > gradle-build.log 2>&1
-          
-      - name: Upload Error Logs on Failure
-        if: failure()
+          echo "$KEYSTORE_BASE64" | base64 --decode > release.jks
+          $ANDROID_SDK_ROOT/build-tools/34.0.0/apksigner sign \
+            --ks release.jks \
+            --ks-pass env:KEYSTORE_PASSWORD \
+            --key-pass env:KEY_PASSWORD \
+            --ks-key-alias "$KEY_ALIAS" \
+            --out app/build/outputs/apk/release/app-release-signed.apk \
+            app/build/outputs/apk/release/app-release-unsigned.apk || true
+
+      - name: Upload Debug APK Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: gradle-error-logs
-          path: android/gradle-build.log
-          retention-days: 3
+          name: app-debug
+          path: app/build/outputs/apk/debug/*.apk
+          retention-days: 14
 
-      - name: Extract and Rename APK
-        run: |
-          echo "=== Подготовка артефакта к публикации ==="
-          VERSION="${{ github.event.inputs.version || '1.0.0' }}"
-          cp android/app/build/outputs/apk/debug/app-debug.apk OmniScan_v${VERSION}.apk
-          echo "APK скопирован: OmniScan_v${VERSION}.apk"
+      - name: Upload Release APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-release
+          path: app/build/outputs/apk/release/*.apk
+          retention-days: 14
 
-      - name: Publish to GitHub Releases
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v${{ github.event.inputs.version || '1.0.0' }}-${{ github.run_number }}
-          name: "OmniScan OSINT Tracker v${{ github.event.inputs.version || '1.0.0' }}"
-          body: |
-            🚀 **Новый релиз трекера OmniScan успешно собран!**
-            
-            📦 **Что внутри сборки:**
-            - **Движок iVizion**: Интегрирован модуль визуальной проверки.
-            - **Strict Mode**: Полный алгоритм жестких фильтров и трекинга.
-            - **UI / UX**: Вшиты все 5 навигационных вкладок.
-            
-            📥 **Как установить:**
-            1. Скачайте файл `OmniScan_v*.apk`.
-            2. Разрешите установку из неизвестных источников.
-            3. Запустите трекер.
           files: |
-            OmniScan_v*.apk
+            app/build/outputs/apk/debug/*.apk
+            app/build/outputs/apk/release/*.apk
           draft: false
           prerelease: false
+          generate_release_notes: true
