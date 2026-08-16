@@ -1,78 +1,55 @@
-name: Full Android APK Build & Diagnose
+name: Build APK from Web App
 
 on:
   push:
-    branches: [ main, master, "**" ]
-  pull_request:
     branches: [ main, master ]
   workflow_dispatch:
 
 jobs:
   build:
-    name: Build Android Package
+    name: Package Web to Android APK
     runs-on: ubuntu-latest
 
     steps:
       - name: 1. Checkout Repository
         uses: actions/checkout@v4
+
+      - name: 2. Setup Node.js Environment
+        uses: actions/setup-node@v4
         with:
-          fetch-depth: 0
+          node-version: 20
 
-      - name: 2. Inspect Repository Structure
-        run: |
-          echo "=== ROOT DIRECTORY CONTENT ==="
-          ls -la
-          echo "=== LOCATING GRADLE / ANDROID FILES ==="
-          find . -maxdepth 3 -not -path '*/.*'
-
-      - name: 3. Set up Java JDK 17
+      - name: 3. Setup Java JDK 17
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: '17'
-          cache: 'gradle'
 
-      - name: 4. Setup Android SDK & Build Tools
+      - name: 4. Setup Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: 5. Accept Licenses & Configure SDK Path
+      - name: 5. Prepare Web Assets & Capacitor
         run: |
-          yes | sdkmanager --licenses || true
-          sdkmanager "platforms;android-34" "build-tools;34.0.0" "platform-tools" || true
-          echo "sdk.dir=$ANDROID_HOME" > local.properties
-          if [ -d "app" ]; then
-            echo "sdk.dir=$ANDROID_HOME" > app/local.properties
-          fi
-
-      - name: 6. Setup Gradle Environment
-        uses: gradle/actions/setup-gradle@v3
-        with:
-          gradle-version: '8.5'
-
-      - name: 7. Build APK with Auto-Detection
-        id: build_step
-        run: |
-          export GRADLE_OPTS="-Dorg.gradle.daemon=false -Dorg.gradle.jvmargs=-Xmx3072m -XX:MaxMetaspaceSize=512m"
+          mkdir -p www
+          # Копируем всё содержимое репо в www (кроме папки .git и workflows)
+          rsync -av --exclude='.git' --exclude='.github' ./ www/ || cp -r index.html www/ 2>/dev/null || true
           
-          if [ -f "./gradlew" ]; then
-            echo "Using project Gradle Wrapper..."
-            chmod +x ./gradlew
-            ./gradlew assembleDebug --stacktrace --info
-          elif [ -f "./build.gradle" ] || [ -f "./build.gradle.kts" ] || [ -f "./settings.gradle" ]; then
-            echo "Using installed Gradle runner..."
-            gradle assembleDebug --stacktrace --info
-          else
-            echo "::error::Не найдены файлы сборки Gradle (build.gradle / settings.gradle) в корне репозитория!"
-            exit 1
-          fi
+          npm init -y
+          npm install @capacitor/core @capacitor/cli @capacitor/android
+          
+          npx cap init "MyApp" "com.app.webview" --web-dir "www"
+          npx cap add android
+          npx cap sync android
 
-      - name: 8. Collect & Upload APK Artifacts
+      - name: 6. Build Debug APK
+        run: |
+          cd android
+          chmod +x ./gradlew
+          ./gradlew assembleDebug --stacktrace
+
+      - name: 7. Upload APK Artifact
         uses: actions/upload-artifact@v4
-        if: always()
         with:
           name: app-debug-apk
-          path: |
-            **/build/outputs/apk/**/*.apk
-            **/build/outputs/bundle/**/*.aab
-          if-no-files-found: warn
+          path: android/app/build/outputs/apk/debug/*.apk
           retention-days: 14
